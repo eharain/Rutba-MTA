@@ -50,7 +50,8 @@ async function main() {
     try { sendWorker.stop(); } catch (_) {}
     try { webhookWorker.stop(); } catch (_) {}
     try { bouncePoller.stop(); } catch (_) {}
-    server.close();
+    // Await server.close so in-flight HTTP requests aren't cut mid-response.
+    await new Promise((resolve) => server.close(() => resolve()));
     try { await db.close(); } catch (_) {}
     process.exit(0);
   }

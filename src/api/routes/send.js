@@ -11,7 +11,7 @@ const messagesSvc = require('../../services/messages');
 const batchesSvc = require('../../services/batches');
 const suppression = require('../../services/suppression');
 const actionsSvc = require('../../services/actions');
-const sendersSvc = require('../../services/senders');
+const db = require('../../db');
 const { isValidEmail, normalizeAddress } = require('../../lib/addresses');
 const { render } = require('../../lib/template');
 const { normalizeClass } = require('../../lib/msgclass');
@@ -25,22 +25,18 @@ router.post('/send', requireTrustToken, async (req, res) => {
     const to = normalizeAddress(b.to);
     if (!isValidEmail(to)) return res.status(400).json({ error: 'invalid recipient' });
 
+    const senderId = req.sender._id;
     const cls = normalizeClass(b.class || 'transactional');
     const sup = await suppression.isSuppressed(req.sender.uuid, to);
     if (sup) {
-      await messagesSvc.createDroppedEvent({
-        senderId: await senderIdFromUuid(req.sender.uuid),
-        address: to, reason: `suppression:${sup.reason}`,
-      });
+      await messagesSvc.createDroppedEvent({ senderId, address: to, reason: `suppression:${sup.reason}` });
       return res.json({ status: 'dropped', reason: sup.reason });
     }
 
     const data = b.data && typeof b.data === 'object' ? b.data : null;
     const subject = data ? render(b.subject, data) : (b.subject || '');
-    let html = data ? render(b.html, data) : (b.html || null);
-    let text = data ? render(b.text, data) : (b.text || null);
-
-    const senderId = await senderIdFromUuid(req.sender.uuid);
+    const html = data ? render(b.html, data) : (b.html || null);
+    const text = data ? render(b.text, data) : (b.text || null);
 
     // Create the row first so we have the id for action tokens.
     const { id, uuid } = await messagesSvc.createQueued({
@@ -59,13 +55,11 @@ router.post('/send', requireTrustToken, async (req, res) => {
       const urlMap = await actionsSvc.createForMessage({
         messageId: id, messageUuid: uuid, senderId, actions: b.actions,
       });
-      // Re-render with the action URLs merged into the data context, then
-      // update the outbox row's subject/html/text.
       const ctx = Object.assign({}, data || {}, urlMap);
       const subject2 = render(b.subject || subject, ctx);
       const html2 = render(b.html || html, ctx);
       const text2 = render(b.text || text, ctx);
-      await require('../../db').query(
+      await db.query(
         `UPDATE outbox SET subject = ?, html = ?, body_text = ? WHERE id = ?`,
         [subject2, html2, text2, id]
       );
@@ -84,9 +78,7 @@ router.post('/send/batch', requireTrustToken, async (req, res) => {
     if (!Array.isArray(b.recipients) || !b.recipients.length) {
       return res.status(400).json({ error: 'recipients required' });
     }
-    // We need the sender row (id) — pass via a quick lookup.
-    const senderId = await senderIdFromUuid(req.sender.uuid);
-    const senderWithId = { ...req.sender, id: senderId };
+    const senderWithId = { ...req.sender, id: req.sender._id };
     const result = await batchesSvc.create({
       sender: senderWithId,
       subject: b.subject,
@@ -107,17 +99,5 @@ router.post('/send/batch', requireTrustToken, async (req, res) => {
     res.status(500).json({ error: 'batch failed', message: e.message });
   }
 });
-
-// Helper: senderIdFromUuid. Cached per-request to avoid extra DB hits.
-const senderIdCache = new Map();
-async function senderIdFromUuid(uuid) {
-  if (senderIdCache.has(uuid)) return senderIdCache.get(uuid);
-  const rows = await require('../../db').query(
-    `SELECT id FROM sender WHERE uuid = ? LIMIT 1`, [uuid]
-  );
-  const id = rows[0] ? rows[0].id : null;
-  if (id) senderIdCache.set(uuid, id);
-  return id;
-}
 
 module.exports = router;

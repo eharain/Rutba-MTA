@@ -106,6 +106,14 @@ class BouncePoller {
       return;
     }
 
+    // Idempotency guard: handleRaw is sequenced after \Seen-marking, so a
+    // crash between handler steps would re-deliver the same DSN. Don't
+    // double-bump reputation, double-suppress, or re-fire webhooks.
+    if (await this._alreadyProcessed(message, parsed)) {
+      log.info(`[bounce] uuid=${message.uuid} already processed — skipping`);
+      return;
+    }
+
     if (parsed.kind === 'complaint') {
       await messages.markBounced(message.id, { reason: 'complaint' });
       await messages.logEvent({
@@ -143,6 +151,18 @@ class BouncePoller {
       await domains.bump(message.to_domain, { deferred: 1 });
       await this.webhook(message, 'bounced', { bounceType: 'soft', smtpCode: parsed.status, reason: parsed.diagnostic });
     }
+  }
+
+  async _alreadyProcessed(message, parsed) {
+    // Complaints have at most one ARF per message; bounces have at most one
+    // hard/soft. If an event of the matching type already exists, treat as
+    // already-handled.
+    const type = parsed.kind === 'complaint' ? 'complained' : 'bounced';
+    const rows = await db.query(
+      `SELECT id FROM event WHERE message_id = ? AND type = ? LIMIT 1`,
+      [message.id, type]
+    );
+    return rows.length > 0;
   }
 
   async webhook(message, event, extra) {

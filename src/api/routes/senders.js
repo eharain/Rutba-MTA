@@ -41,20 +41,20 @@ router.post('/', async (req, res) => {
       isAdmin: first ? true : !!body.isAdmin,
     });
     // trustToken is shown ONCE.
-    res.status(201).json({ sender, trustToken, webhookSecret });
+    res.status(201).json({ sender: sendersSvc.apiView(sender), trustToken, webhookSecret });
   } catch (e) {
     res.status(500).json({ error: 'register failed', message: e.message });
   }
 });
 
 router.get('/me', requireTrustToken, (req, res) => {
-  res.json({ sender: req.sender });
+  res.json({ sender: sendersSvc.apiView(req.sender) });
 });
 
 router.put('/me', requireTrustToken, async (req, res) => {
   try {
     const updated = await sendersSvc.update(req.sender.uuid, req.body || {});
-    res.json({ sender: updated });
+    res.json({ sender: sendersSvc.apiView(updated) });
   } catch (e) {
     res.status(500).json({ error: 'update failed', message: e.message });
   }
@@ -68,6 +68,11 @@ router.delete('/me', requireTrustToken, async (req, res) => {
 router.post('/me/rotate-token', requireTrustToken, async (req, res) => {
   const trustToken = await sendersSvc.rotateToken(req.sender.uuid);
   res.json({ trustToken });
+});
+
+router.post('/me/rotate-webhook-secret', requireTrustToken, async (req, res) => {
+  const webhookSecret = await sendersSvc.rotateWebhookSecret(req.sender.uuid);
+  res.json({ webhookSecret });
 });
 
 module.exports = router;

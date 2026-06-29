@@ -15,6 +15,8 @@ const { encrypt } = require('../lib/crypto');
 const { normalizeAddress } = require('../lib/addresses');
 const config = require('../config');
 
+// NOTE: `s.id` is selected but mapped to `_id` in publicView; apiView() strips
+// it before returning over HTTP so the numeric pk never leaks.
 const PUBLIC_FIELDS = `
   s.id, s.uuid, s.address, s.display_name, s.reply_to,
   s.smtp_host, s.smtp_port, s.smtp_secure, s.smtp_username,
@@ -24,6 +26,10 @@ const PUBLIC_FIELDS = `
 function publicView(row) {
   if (!row) return null;
   return {
+    // Internal numeric id, leading underscore so it's obvious it should not
+    // be serialised to API responses. Useful for in-process joins without
+    // a second SELECT per request.
+    _id: row.id,
     uuid: row.uuid,
     address: row.address,
     displayName: row.display_name,
@@ -40,6 +46,13 @@ function publicView(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/** Strip internal fields (`_id`, …) before returning a sender over the API. */
+function apiView(view) {
+  if (!view) return null;
+  const { _id, ...rest } = view;
+  return rest;
 }
 
 /**
@@ -131,33 +144,66 @@ async function update(uuid, patch) {
 
   const sets = [];
   const args = [];
+  let smtpChanged = false;
+  let webhookCleared = false;
   if (patch.displayName !== undefined) { sets.push('display_name = ?'); args.push(patch.displayName); }
   if (patch.replyTo !== undefined)    { sets.push('reply_to = ?'); args.push(patch.replyTo); }
-  if (patch.webhookUrl !== undefined) { sets.push('webhook_url = ?'); args.push(patch.webhookUrl); }
+  if (patch.webhookUrl !== undefined) {
+    sets.push('webhook_url = ?');
+    args.push(patch.webhookUrl);
+    if (!patch.webhookUrl) webhookCleared = true;
+  }
   if (patch.smtp) {
-    if (patch.smtp.host !== undefined)     { sets.push('smtp_host = ?'); args.push(patch.smtp.host); }
-    if (patch.smtp.port !== undefined)     { sets.push('smtp_port = ?'); args.push(patch.smtp.port); }
-    if (patch.smtp.secure !== undefined)   { sets.push('smtp_secure = ?'); args.push(patch.smtp.secure ? 1 : 0); }
-    if (patch.smtp.username !== undefined) { sets.push('smtp_username = ?'); args.push(patch.smtp.username); }
+    if (patch.smtp.host !== undefined)     { sets.push('smtp_host = ?');     args.push(patch.smtp.host);     smtpChanged = true; }
+    if (patch.smtp.port !== undefined)     { sets.push('smtp_port = ?');     args.push(patch.smtp.port);     smtpChanged = true; }
+    if (patch.smtp.secure !== undefined)   { sets.push('smtp_secure = ?');   args.push(patch.smtp.secure ? 1 : 0); smtpChanged = true; }
+    if (patch.smtp.username !== undefined) { sets.push('smtp_username = ?'); args.push(patch.smtp.username); smtpChanged = true; }
     if (patch.smtp.password !== undefined) {
       sets.push('smtp_password_enc = ?');
       args.push(patch.smtp.password
         ? encrypt(patch.smtp.password, config.secrets.smtpEnc)
         : null);
+      smtpChanged = true;
     }
   }
   if (!sets.length) return sender;
+
+  // Internal id for cache invalidation (transport + pending webhooks).
+  const idRows = await db.query(`SELECT id FROM sender WHERE uuid = ?`, [uuid]);
+  const senderId = idRows[0] && idRows[0].id;
+
   args.push(uuid);
   await db.query(`UPDATE sender SET ${sets.join(', ')} WHERE uuid = ?`, args);
+
+  if (smtpChanged && senderId) {
+    // Close the cached pooled transport so the next send opens a fresh
+    // session with the updated credentials.
+    try { require('../smtp/transport').closeFor(senderId); } catch (_) {}
+  }
+  if (webhookCleared && senderId) {
+    // Pending webhooks for a sender whose webhook_url was just cleared will
+    // be skipped by the dispatcher forever — mark them failed to surface
+    // the change in operator dashboards.
+    await db.query(
+      `UPDATE webhook_delivery SET status = 'failed', last_error = 'webhook_url cleared'
+        WHERE sender_id = ? AND status = 'pending'`,
+      [senderId]
+    );
+  }
   return findByUuid(uuid);
 }
 
 /** Soft-delete. In-flight messages drain naturally; future sends are rejected. */
 async function softDelete(uuid) {
+  const idRows = await db.query(`SELECT id FROM sender WHERE uuid = ?`, [uuid]);
+  const senderId = idRows[0] && idRows[0].id;
   await db.query(
     `UPDATE sender SET status = 'deleted' WHERE uuid = ?`,
     [uuid]
   );
+  if (senderId) {
+    try { require('../smtp/transport').closeFor(senderId); } catch (_) {}
+  }
 }
 
 /**
@@ -173,7 +219,18 @@ async function rotateToken(uuid) {
   return newToken;
 }
 
+/** Rotate the webhook-signing secret. Returns the new raw secret (shown ONCE). */
+async function rotateWebhookSecret(uuid) {
+  const newSecret = randomSecret(24);
+  await db.query(
+    `UPDATE sender SET webhook_secret = ? WHERE uuid = ?`,
+    [newSecret, uuid]
+  );
+  return newSecret;
+}
+
 module.exports = {
   register, findByUuid, findByAddress, authenticate,
-  getInternalById, update, softDelete, rotateToken, publicView,
+  getInternalById, update, softDelete, rotateToken, rotateWebhookSecret,
+  publicView, apiView,
 };

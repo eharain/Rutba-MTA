@@ -44,32 +44,36 @@ router.get('/action/:token', async (req, res) => {
   const row = await actionsSvc.findByToken(req.params.token);
   if (!row) return res.status(404).json({ error: 'action not found' });
 
-  // Record (idempotent — re-clicks update nothing).
+  // Idempotency: first-click fires the event + webhook; subsequent clicks
+  // still redirect (recipient may have hit the link twice) but don't re-fire.
+  const wasFirstClick = !row.clicked_at;
   await actionsSvc.markClicked(row.id, {
     ip: req.ip,
     userAgent: req.get('user-agent'),
   });
-  await messages.logEvent({
-    messageId: row.message_id, messageUuid: row.message_uuid, senderId: row.sender_id,
-    type: 'action_clicked',
-    extra: { key: row.action_key, type: row.action_type },
-  });
-  try {
-    await webhooks.enqueue({
-      senderId: row.sender_id,
-      messageId: row.message_id,
-      eventType: 'action_clicked',
-      payload: {
-        event: 'action_clicked',
-        message_uuid: row.message_uuid,
-        action_key: row.action_key,
-        action_type: row.action_type,
-        redirect_url: row.redirect_url,
-        ip: req.ip,
-        occurred_at: new Date().toISOString(),
-      },
+  if (wasFirstClick) {
+    await messages.logEvent({
+      messageId: row.message_id, messageUuid: row.message_uuid, senderId: row.sender_id,
+      type: 'action_clicked',
+      extra: { key: row.action_key, type: row.action_type },
     });
-  } catch (e) { log.warn('[action] webhook enqueue', e.message); }
+    try {
+      await webhooks.enqueue({
+        senderId: row.sender_id,
+        messageId: row.message_id,
+        eventType: 'action_clicked',
+        payload: {
+          event: 'action_clicked',
+          message_uuid: row.message_uuid,
+          action_key: row.action_key,
+          action_type: row.action_type,
+          redirect_url: row.redirect_url,
+          ip: req.ip,
+          occurred_at: new Date().toISOString(),
+        },
+      });
+    } catch (e) { log.warn('[action] webhook enqueue', e.message); }
+  }
 
   res.redirect(302, row.redirect_url);
 });
@@ -88,32 +92,37 @@ async function handleUnsubscribe(req, res, viaPost) {
   const senderUuid = senderRows[0] && senderRows[0].uuid;
   if (!senderUuid) return res.status(404).json({ error: 'sender not found' });
 
+  // Idempotency: re-clicks (forwarded links, browser back-button, mail-
+  // client preview prefetch) must not re-emit events or webhooks.
+  const wasAlready = !!message.unsubscribed_at;
   await suppression.suppress({
     address: message.to_addr,
     scope: senderUuid,
     reason: 'unsubscribe',
     sourceUuid: message.uuid,
   });
-  await db.query(`UPDATE outbox SET unsubscribed_at = NOW() WHERE id = ?`, [message.id]);
-  await messages.logEvent({
-    messageId: message.id, messageUuid: message.uuid, senderId: message.sender_id,
-    type: 'unsubscribed', reason: viaPost ? 'one-click' : 'web',
-  });
-  try {
-    await webhooks.enqueue({
-      senderId: message.sender_id,
-      messageId: message.id,
-      eventType: 'unsubscribed',
-      payload: {
-        event: 'unsubscribed',
-        message_uuid: message.uuid,
-        address: message.to_addr,
-        scope: senderUuid,
-        via: viaPost ? 'one-click' : 'web',
-        occurred_at: new Date().toISOString(),
-      },
+  if (!wasAlready) {
+    await db.query(`UPDATE outbox SET unsubscribed_at = NOW() WHERE id = ?`, [message.id]);
+    await messages.logEvent({
+      messageId: message.id, messageUuid: message.uuid, senderId: message.sender_id,
+      type: 'unsubscribed', reason: viaPost ? 'one-click' : 'web',
     });
-  } catch (e) { log.warn('[unsub] webhook enqueue', e.message); }
+    try {
+      await webhooks.enqueue({
+        senderId: message.sender_id,
+        messageId: message.id,
+        eventType: 'unsubscribed',
+        payload: {
+          event: 'unsubscribed',
+          message_uuid: message.uuid,
+          address: message.to_addr,
+          scope: senderUuid,
+          via: viaPost ? 'one-click' : 'web',
+          occurred_at: new Date().toISOString(),
+        },
+      });
+    } catch (e) { log.warn('[unsub] webhook enqueue', e.message); }
+  }
 
   if (viaPost) return res.status(200).json({ status: 'unsubscribed' });
   res.type('html').send(`<!doctype html><html><body style="font-family:sans-serif;max-width:480px;margin:48px auto;padding:24px">

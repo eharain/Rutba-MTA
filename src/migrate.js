@@ -2,7 +2,14 @@
 
 /**
  * Tiny forward-only migrator. Runs every *.sql in migrations/ in filename order,
- * tracked in a `_migrations` table so each file is applied once. Idempotent.
+ * tracked in a `_migrations` table so each file is applied once.
+ *
+ * Idempotency caveat: MySQL/InnoDB IMPLICITLY COMMITS before and after every DDL
+ * statement (CREATE TABLE, ALTER TABLE, CREATE INDEX, …). The `withTransaction`
+ * wrapper below therefore does NOT roll back partial migrations on failure —
+ * authors of new migration files must make each individual DDL statement safely
+ * re-runnable (e.g. `CREATE TABLE IF NOT EXISTS`, `DROP COLUMN IF EXISTS`,
+ * check column existence before ALTER). DML inside a migration IS transactional.
  *
  * Usage: node src/migrate.js   (also called on boot from index.js)
  */

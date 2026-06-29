@@ -22,20 +22,27 @@ const suppression = require('../services/suppression');
 const domains = require('../services/domains');
 const webhooks = require('../services/webhooks');
 const transport = require('../smtp/transport');
-const { needsUnsubscribe, bypassesPacing } = require('../lib/msgclass');
+const { needsUnsubscribe } = require('../lib/msgclass');
 const { render } = require('../lib/template');
 const { classifyError, shouldSuppress } = require('../lib/classify');
 const { nextDelaySeconds } = require('../lib/backoff');
 const { sign: signToken } = require('../lib/tokens');
+const { DomainLimiter } = require('../lib/rate-limiter');
 
 class SendWorker {
   constructor() {
     this.running = false;
     this.timer = null;
     this.pruneTick = 0;
-    // Domain → last-send timestamp (ms). Lets us enforce reputation delay
-    // in-process without an extra DB hit per message.
-    this.lastDomainSend = new Map();
+    // In-process concurrency cap (global + per-domain). Adaptive pacing and
+    // the per-minute hard ceiling are enforced by domains.tryReserveSlot
+    // (atomic across replicas). DomainLimiter only stops one replica from
+    // opening too many concurrent SMTP sessions at once.
+    this.limiter = new DomainLimiter({
+      globalMaxInflight: config.worker.globalMaxInflight,
+      maxInflightPerDomain: config.worker.maxInflightPerDomain,
+      defaultMinIntervalMs: 0,
+    });
   }
 
   start() {
@@ -63,18 +70,18 @@ class SendWorker {
     }
     const due = await messages.selectDue({ limit: config.worker.batchSize });
     for (const row of due) {
-      // Marketing: enforce per-domain reputation delay (in-process gate).
-      if (!bypassesPacing(row.msg_class)) {
-        const last = this.lastDomainSend.get(row.to_domain) || 0;
-        const delay = await domains.delayMsFor(row.to_domain);
-        if (Date.now() - last < delay) continue;
-      }
-      // Hard ceiling (transactional + marketing).
-      const reserved = await domains.tryReserveCeiling(row.to_domain);
+      // 1) In-process concurrency cap — prevents this replica from opening
+      //    too many parallel SMTP sessions to one domain.
+      if (!this.limiter.canSend(row.to_domain, Date.now())) continue;
+      // 2) Cross-replica atomic pace + ceiling reservation.
+      const reserved = await domains.tryReserveSlot(row.to_domain, row.msg_class);
       if (!reserved) continue;
-      // Process (do NOT await — fan out so a slow SMTP doesn't block the tick).
-      this.processOne(row).catch((e) => log.error('[worker] processOne', e.message));
-      this.lastDomainSend.set(row.to_domain, Date.now());
+      // 3) Claim the inflight slot and fan out (do NOT await — a slow SMTP
+      //    shouldn't block the tick from processing other domains).
+      this.limiter.acquire(row.to_domain, Date.now());
+      this.processOne(row)
+        .catch((e) => log.error('[worker] processOne', e.message))
+        .finally(() => this.limiter.release(row.to_domain));
     }
   }
 

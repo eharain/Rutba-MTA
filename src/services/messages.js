@@ -123,8 +123,10 @@ async function markBounced(id, { reason, smtpCode = null, bounceType = null }) {
   return { smtpCode, bounceType };
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function findByIdOrUuid(idOrUuid) {
-  const isUuid = typeof idOrUuid === 'string' && idOrUuid.length === 36;
+  const isUuid = typeof idOrUuid === 'string' && UUID_RE.test(idOrUuid);
   const rows = await db.query(
     `SELECT * FROM outbox WHERE ${isUuid ? 'uuid' : 'id'} = ? LIMIT 1`,
     [idOrUuid]

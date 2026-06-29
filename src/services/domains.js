@@ -67,37 +67,67 @@ async function delayMsFor(domain) {
 }
 
 /**
- * Hard-ceiling check + counter-increment in one atomic step. Returns true if
- * a send slot was reserved for this minute, false if the ceiling is hit.
+ * Cross-replica send-slot reservation. Atomically:
+ *  - locks the domain's reputation row
+ *  - for MARKETING: enforces the reputation-derived inter-send delay vs
+ *    `last_sent_at` (cross-replica pacing — the previous in-process gate
+ *    only saw THIS replica's sends)
+ *  - for ALL classes: enforces the per-domain hard ceiling
+ *    (messages/minute) and increments the bucket
+ *  - stamps `last_sent_at` so concurrent ticks across replicas observe the
+ *    reservation immediately
  *
- * The bucket row is upserted with INSERT … ON DUPLICATE KEY UPDATE so the
- * increment is atomic across worker replicas.
+ * Returns true if the caller may send, false if the caller must wait.
  */
-async function tryReserveCeiling(domain, now = new Date()) {
+async function tryReserveSlot(domain, msgClass, now = new Date()) {
   const lc = String(domain || '').toLowerCase();
   if (!lc) return true;
-  const row = await getOrCreate(lc);
-  const ceiling = row && row.max_per_minute
-    ? Number(row.max_per_minute)
-    : config.worker.defaultMaxPerMinute;
-  if (!ceiling || ceiling <= 0) return true;
+  await getOrCreate(lc); // ensure the row exists before FOR UPDATE
+  const isMarketing = msgClass !== 'transactional';
 
-  const minuteStart = new Date(now);
-  minuteStart.setSeconds(0, 0);
-
-  // Upsert + read in one connection so we can compare BEFORE-counts.
   return db.withTransaction(async (conn) => {
-    const [cur] = await conn.query(
-      `SELECT count FROM domain_rate_bucket WHERE domain = ? AND minute_start = ? FOR UPDATE`,
-      [lc, minuteStart]
+    const [rows] = await conn.query(
+      `SELECT * FROM domain_reputation WHERE domain = ? FOR UPDATE`,
+      [lc]
     );
-    const used = cur[0] ? Number(cur[0].count) : 0;
-    if (used >= ceiling) return false;
+    const row = rows[0];
+    if (!row) return true; // ghost — let it through; getOrCreate will catch it next tick
+
+    // Marketing pacing: cross-replica inter-send delay.
+    if (isMarketing) {
+      const score = effectiveScore(row, config.worker.warmupMinSamples);
+      const delayMs = delayForScore(score);
+      if (row.last_sent_at && delayMs > 0) {
+        const lastMs = new Date(row.last_sent_at).getTime();
+        if (now.getTime() - lastMs < delayMs) return false;
+      }
+    }
+
+    // Hard ceiling (all classes).
+    const ceiling = row.max_per_minute
+      ? Number(row.max_per_minute)
+      : config.worker.defaultMaxPerMinute;
+    if (ceiling && ceiling > 0) {
+      const minuteStart = new Date(now);
+      minuteStart.setSeconds(0, 0);
+      const [bucketRows] = await conn.query(
+        `SELECT count FROM domain_rate_bucket WHERE domain = ? AND minute_start = ?`,
+        [lc, minuteStart]
+      );
+      const used = bucketRows[0] ? Number(bucketRows[0].count) : 0;
+      if (used >= ceiling) return false;
+      await conn.query(
+        `INSERT INTO domain_rate_bucket (domain, minute_start, count)
+           VALUES (?, ?, 1)
+         ON DUPLICATE KEY UPDATE count = count + 1`,
+        [lc, minuteStart]
+      );
+    }
+
+    // Stamp last_sent_at so the next replica/tick sees the reservation.
     await conn.query(
-      `INSERT INTO domain_rate_bucket (domain, minute_start, count)
-         VALUES (?, ?, 1)
-       ON DUPLICATE KEY UPDATE count = count + 1`,
-      [lc, minuteStart]
+      `UPDATE domain_reputation SET last_sent_at = ? WHERE domain = ?`,
+      [now, lc]
     );
     return true;
   });
@@ -147,6 +177,6 @@ async function resetCounters(domain) {
 
 module.exports = {
   getOrCreate, bump, scoreFor, delayMsFor,
-  tryReserveCeiling, pruneBuckets,
+  tryReserveSlot, pruneBuckets,
   listAll, setOverrides, resetCounters,
 };

@@ -29,6 +29,7 @@ async function isSuppressed(senderUuid, address) {
 async function suppress({ address, scope = 'global', reason = 'manual_block', sourceUuid = null, note = null }) {
   const addr = normalizeAddress(address);
   if (!addr) throw new Error('address required');
+  if (!scope || typeof scope !== 'string') throw new Error('scope required (global or sender uuid)');
   // Upsert: re-suppression reactivates a previously cleared row and refreshes
   // the reason so the latest signal wins.
   await db.query(

@@ -15,6 +15,7 @@
  *   4. 302-redirects to the registered `redirect_url`
  */
 
+const crypto = require('crypto');
 const db = require('../db');
 const { sign } = require('../lib/tokens');
 const config = require('../config');
@@ -49,17 +50,19 @@ async function createForMessage({ messageId, messageUuid, senderId, actions = []
   for (const a of actions) {
     if (!a || !a.key || !a.redirect) continue;
     const expiresAt = expiryFromHours(a.expires_hours);
-    // Sign first so the token IS the row's primary identifier.
-    // We use a tentative id of 0 for the signature payload because the row
-    // doesn't exist yet — but the token's `id` field needs to point at the
-    // row. So insert first, then sign with the inserted id, then UPDATE
-    // the token column.
+    // Two-phase insert: we need the row's auto-increment id to sign the
+    // final token, but `token` is UNIQUE and used as a primary lookup key.
+    // Phase 1 inserts a unique random placeholder (NOT a constant — a
+    // constant collides under concurrent inserts via UNIQUE constraint);
+    // Phase 2 swaps it for the HMAC-signed token bound to the row's id.
+    const placeholder = `pending:${crypto.randomBytes(16).toString('hex')}`;
     const res = await db.query(
       `INSERT INTO message_action
         (token, message_id, message_uuid, sender_id, action_key, action_type, label,
          redirect_url, expires_at)
-       VALUES ('__pending__', ?,?,?,?,?,?, ?, ?)`,
+       VALUES (?, ?,?,?,?,?,?, ?, ?)`,
       [
+        placeholder,
         messageId, messageUuid, senderId,
         String(a.key).slice(0, 64),
         normalizeType(a.type),
@@ -69,8 +72,6 @@ async function createForMessage({ messageId, messageUuid, senderId, actions = []
       ]
     );
     const token = sign(config.secrets.hmac, 'action', res.insertId, expiresAt.getTime());
-    // 64-char column (HMAC tokens are longer; widen if needed). The schema
-    // allocates CHAR(64); base64url payload+mac is ~67 chars so we widen.
     await db.query(`UPDATE message_action SET token = ? WHERE id = ?`, [token, res.insertId]);
     out[a.key] = `${config.publicBaseUrl}/action/${encodeURIComponent(token)}`;
   }
