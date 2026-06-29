@@ -1,35 +1,30 @@
 'use strict';
 
-const crypto = require('crypto');
-const config = require('../config');
-
 /**
- * API-key auth. Each product sends `X-Api-Key: <key>`; the key maps to an `app`
- * (tenant). Apps listed in MAILER_ADMIN_APPS may do global suppression and
- * cross-tenant reads. Comparison is constant-time to avoid timing leaks.
+ * Trust-token auth middleware. Loads the sender record (or 401s) and attaches
+ * it to req.sender. Admin-only routes additionally check sender.is_admin.
  */
-function timingSafeEqualStr(a, b) {
-  const ba = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
-}
 
-function resolveApp(presentedKey) {
-  for (const [key, app] of config.apiKeys.entries()) {
-    if (timingSafeEqualStr(key, presentedKey)) return app;
+const sendersSvc = require('../services/senders');
+
+async function requireTrustToken(req, res, next) {
+  try {
+    const token = req.get('X-Trust-Token') || (req.query && req.query.token) || '';
+    if (!token) return res.status(401).json({ error: 'missing trust token' });
+    const sender = await sendersSvc.authenticate(token);
+    if (!sender) return res.status(401).json({ error: 'invalid trust token' });
+    req.sender = sender;
+    next();
+  } catch (e) {
+    res.status(500).json({ error: 'auth failure', message: e.message });
   }
-  return null;
 }
 
-function requireApiKey(req, res, next) {
-  const presented = req.get('X-Api-Key') || '';
-  if (!presented) return res.status(401).json({ error: 'missing_api_key' });
-  const app = resolveApp(presented);
-  if (!app) return res.status(401).json({ error: 'invalid_api_key' });
-  req.tenant = app; // NB: not req.app (that is the Express app)
-  req.isAdmin = config.adminApps.has(app);
+function requireAdmin(req, res, next) {
+  if (!req.sender || !req.sender.isAdmin) {
+    return res.status(403).json({ error: 'admin only' });
+  }
   next();
 }
 
-module.exports = { requireApiKey, resolveApp };
+module.exports = { requireTrustToken, requireAdmin };

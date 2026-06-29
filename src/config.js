@@ -1,9 +1,9 @@
 'use strict';
 
 /**
- * Central config from env. The gateway is product-neutral: every product
- * (TrustList, Rutba ERP, future offers) authenticates with its own API key and
- * is identified by the `app`/tenant that key maps to.
+ * Central config from env. Rutba MTA is multi-tenant: every sender authenticates
+ * with its own trust token (issued at registration) and brings its own SMTP
+ * credentials — there are no global per-app keys or a global SMTP sender.
  */
 
 function bool(v, def = false) {
@@ -15,21 +15,6 @@ function int(v, def) {
   return Number.isFinite(n) ? n : def;
 }
 
-// MAILER_API_KEYS = "trustlist:key_aaa,rutba:key_bbb"  (app:key pairs)
-function parseApiKeys(raw) {
-  const keyToApp = new Map();
-  for (const pair of String(raw || '').split(',')) {
-    const t = pair.trim();
-    if (!t) continue;
-    const i = t.indexOf(':');
-    if (i < 1) continue;
-    const app = t.slice(0, i).trim();
-    const key = t.slice(i + 1).trim();
-    if (app && key) keyToApp.set(key, app);
-  }
-  return keyToApp;
-}
-
 const config = {
   port: int(process.env.MAILER_PORT, 8025),
   env: process.env.NODE_ENV || 'development',
@@ -39,35 +24,27 @@ const config = {
     port: int(process.env.MAILER_DB_PORT || process.env.DB_PORT, 3306),
     user: process.env.MAILER_DB_USER || process.env.DB_USER,
     password: process.env.MAILER_DB_PASSWORD || process.env.DB_PASSWORD,
-    database: process.env.MAILER_DB_NAME || 'trustlist_mailer',
+    database: process.env.MAILER_DB_NAME || 'mailers',
     connectionLimit: int(process.env.MAILER_DB_POOL, 10),
   },
 
-  smtp: {
-    host: process.env.SMTP_HOST || 'mail.trustlist.uk',
-    port: int(process.env.SMTP_PORT, 587),
-    secure: bool(process.env.SMTP_SECURE, false), // 587 = STARTTLS
-    user: process.env.SMTP_USERNAME || '',
-    pass: process.env.SMTP_PASSWORD || '',
-    from: process.env.SMTP_FROM || 'no-reply@trustlist.uk',
-    replyTo: process.env.SMTP_REPLY_TO || 'contact@trustlist.uk',
-    // Connection pooling = receiver/receiving-server care (don't hammer a new
-    // TCP+TLS handshake per message; cap concurrent connections + messages/conn).
-    pool: bool(process.env.SMTP_POOL, true),
-    maxConnections: int(process.env.SMTP_MAX_CONNECTIONS, 5),
-    maxMessages: int(process.env.SMTP_MAX_MESSAGES, 100),
+  // Secrets. Both MUST be set in production. The HMAC secret signs action /
+  // unsubscribe tokens; the encryption key wraps stored SMTP passwords.
+  secrets: {
+    hmac: process.env.MAILER_HMAC_SECRET || '',
+    smtpEnc: process.env.MAILER_SMTP_ENC_KEY || '',
   },
 
-  // VERP bounce return-path domain. Outbound envelope-from becomes
-  // bounce+<uuid>@<bounceDomain> so DSNs route to the monitored mailbox and the
-  // poller can match a bounce back to the exact message by uuid.
+  // VERP bounce return-path. Outbound envelope-from becomes
+  // bounce+<uuid>@<bounceDomain> so the IMAP poller can match bounces back to
+  // the originating message by uuid.
   bounce: {
     enabled: bool(process.env.MAILER_BOUNCE_ENABLED, false),
-    domain: process.env.MAILER_BOUNCE_DOMAIN || 'bounce.trustlist.uk',
+    domain: process.env.MAILER_BOUNCE_DOMAIN || 'bounce.rutba-mta.local',
     mailbox: process.env.MAILER_BOUNCE_MAILBOX || 'INBOX',
     pollIntervalMs: int(process.env.MAILER_BOUNCE_POLL_MS, 60000),
     imap: {
-      host: process.env.MAILER_BOUNCE_IMAP_HOST || process.env.SMTP_HOST || 'mail.trustlist.uk',
+      host: process.env.MAILER_BOUNCE_IMAP_HOST || '',
       port: int(process.env.MAILER_BOUNCE_IMAP_PORT, 993),
       secure: bool(process.env.MAILER_BOUNCE_IMAP_SECURE, true),
       user: process.env.MAILER_BOUNCE_IMAP_USER || '',
@@ -81,21 +58,27 @@ const config = {
     batchSize: int(process.env.MAILER_WORKER_BATCH, 50),
     globalMaxInflight: int(process.env.MAILER_GLOBAL_INFLIGHT, 20),
     maxInflightPerDomain: int(process.env.MAILER_DOMAIN_INFLIGHT, 5),
-    // Floor delay between sends to the same domain (ms), independent of score.
-    defaultMinIntervalMs: int(process.env.MAILER_DOMAIN_MIN_INTERVAL_MS, 0),
+    // Per-receiving-domain hard ceiling fallback (messages/minute) when no
+    // domain-specific override is set. Applies to ALL classes, including
+    // transactional.
+    defaultMaxPerMinute: int(process.env.MAILER_DOMAIN_MAX_PER_MIN, 600),
+    // Minimum sends to a domain before its reputation score is trusted.
+    // During warmup we treat the domain as score 80.
+    warmupMinSamples: int(process.env.MAILER_WARMUP_MIN, 20),
   },
 
-  // app:key map + the apps allowed to do global suppression / cross-tenant reads.
-  apiKeys: parseApiKeys(process.env.MAILER_API_KEYS),
-  adminApps: new Set(
-    String(process.env.MAILER_ADMIN_APPS || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-  ),
+  webhook: {
+    timeoutMs: int(process.env.MAILER_WEBHOOK_TIMEOUT_MS, 10000),
+    maxAttempts: int(process.env.MAILER_WEBHOOK_MAX_ATTEMPTS, 6),
+    tickMs: int(process.env.MAILER_WEBHOOK_TICK_MS, 5000),
+  },
 
-  // Public base URL the unsubscribe + open-pixel links point at (this service).
+  // Public base URL the action/unsubscribe links point at (this service).
+  // MUST be set in production or links will be broken.
   publicBaseUrl: (process.env.MAILER_PUBLIC_URL || '').replace(/\/$/, ''),
+
+  // Default per-action expiry when the caller doesn't set one (hours).
+  defaultActionExpiryHours: int(process.env.MAILER_ACTION_EXPIRY_HOURS, 72),
 };
 
 module.exports = config;

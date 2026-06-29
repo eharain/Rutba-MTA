@@ -1,144 +1,213 @@
 'use strict';
 
-const config = require('../config');
-const log = require('../logger');
-const messages = require('../services/messages');
-const reputation = require('../services/reputation');
-const suppression = require('../services/suppression');
-const transport = require('../smtp/transport');
-const { DomainLimiter } = require('../lib/rate-limiter');
-const { delayForScore } = require('../lib/reputation');
-const { bypassesPacing } = require('../lib/msgclass');
-const { nextDelaySeconds } = require('../lib/backoff');
-const { classifyError, shouldSuppress, smtpResponseCode } = require('../lib/classify');
-const { domainOf } = require('../lib/addresses');
-
 /**
- * The send worker drains the email_message queue, respecting:
- *  - per-domain drip (reputation score → delay) + per-domain & global concurrency
- *  - transactional bypass of pacing (still bounded by concurrency)
- *  - retry/backoff for transient failures; suppression for hard recipient rejects
- *
- * Single-process async loop; claimSending() is an atomic DB transition so even
- * overlapping ticks (or a second worker) never double-send.
+ * Send worker. Drains the outbox queue:
+ *   1. Pulls due rows; transactional are returned first (selectDue ORDER BY).
+ *   2. For each row:
+ *      - Resolve sender (load credentials).
+ *      - If marketing: check per-domain reputation delay (skip if not ready).
+ *      - Reserve a slot under the per-domain hard ceiling.
+ *      - Atomically claim the row.
+ *      - Render templates (subject/html/text) with stored data + action URLs.
+ *      - SMTP-send via the sender's pooled transport.
+ *      - Record sent/deferred/bounced/failed; update domain reputation; webhook.
  */
+
+const db = require('../db');
+const log = require('../logger');
+const config = require('../config');
+const messages = require('../services/messages');
+const sendersSvc = require('../services/senders');
+const suppression = require('../services/suppression');
+const domains = require('../services/domains');
+const webhooks = require('../services/webhooks');
+const transport = require('../smtp/transport');
+const { needsUnsubscribe, bypassesPacing } = require('../lib/msgclass');
+const { render } = require('../lib/template');
+const { classifyError, shouldSuppress } = require('../lib/classify');
+const { nextDelaySeconds } = require('../lib/backoff');
+const { sign: signToken } = require('../lib/tokens');
+
 class SendWorker {
   constructor() {
-    this.limiter = new DomainLimiter({
-      globalMaxInflight: config.worker.globalMaxInflight,
-      maxInflightPerDomain: config.worker.maxInflightPerDomain,
-      defaultMinIntervalMs: config.worker.defaultMinIntervalMs,
-    });
-    this.scoreCache = new Map();
-    this.inflight = new Set();
+    this.running = false;
     this.timer = null;
-    this.stopping = false;
+    this.pruneTick = 0;
+    // Domain → last-send timestamp (ms). Lets us enforce reputation delay
+    // in-process without an extra DB hit per message.
+    this.lastDomainSend = new Map();
   }
 
-  async start() {
-    try { this.scoreCache = await reputation.scoreMap(); } catch (e) { log.warn('[worker] score preload failed:', e.message); }
-    const loop = async () => {
-      if (this.stopping) return;
-      try { await this.tick(); } catch (e) { log.error('[worker] tick error:', e.message); }
-      this.timer = setTimeout(loop, config.worker.tickMs);
-    };
-    loop();
-    // Refresh the reputation cache periodically (cheap; bounces change scores).
-    this.repTimer = setInterval(async () => {
-      try { this.scoreCache = await reputation.scoreMap(); } catch (_) { /* ignore */ }
-    }, Math.max(30000, config.worker.tickMs * 30));
-    log.info('[worker] started');
+  start() {
+    if (this.running) return;
+    this.running = true;
+    log.info('[worker] start');
+    this.timer = setInterval(() => this.tick().catch((e) => log.error('[worker] tick', e.message)),
+      config.worker.tickMs);
+  }
+
+  stop() {
+    this.running = false;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    transport.closeAll();
+    log.info('[worker] stop');
   }
 
   async tick() {
-    const due = await messages.selectDue(config.worker.batchSize);
-    if (!due.length) return;
-    const now = Date.now();
-    for (const m of due) {
-      if (this.inflight.has(m.id)) continue;
-      const domain = m.to_domain || domainOf(m.to_addr);
-      const score = this.scoreCache.has(domain) ? this.scoreCache.get(domain) : 100;
-      const minInterval = bypassesPacing(m.msg_class) ? 0 : delayForScore(score);
-      if (!this.limiter.canSend(domain, now, minInterval)) continue;
-
-      const won = await messages.claimSending(m.id);
-      if (!won) continue;
-
-      this.inflight.add(m.id);
-      this.limiter.acquire(domain, Date.now());
-      // Fire async; bounded by the limiter's concurrency caps via canSend above.
-      this._send(m, domain).finally(() => {
-        this.limiter.release(domain);
-        this.inflight.delete(m.id);
-      });
+    if (!this.running) return;
+    // Periodic housekeeping: prune old rate buckets every ~minute.
+    this.pruneTick = (this.pruneTick + 1) % 60;
+    if (this.pruneTick === 0) {
+      domains.pruneBuckets().catch((e) => log.warn('[worker] prune', e.message));
     }
-  }
-
-  async _send(m, domain) {
-    let headers = null;
-    try { headers = m.headers ? (typeof m.headers === 'string' ? JSON.parse(m.headers) : m.headers) : null; } catch (_) { headers = null; }
-
-    const unsubscribeUrl = config.publicBaseUrl ? `${config.publicBaseUrl}/unsubscribe/${m.uuid}` : null;
-
-    try {
-      const providerId = await transport.sendMessage({
-        uuid: m.uuid,
-        app: m.app,
-        from: m.from_addr,
-        replyTo: m.reply_to,
-        to: m.to_addr,
-        subject: m.subject,
-        html: m.html,
-        text: m.body_text,
-        headers,
-        unsubscribeUrl,
-      });
-      await messages.markSent(m.id, providerId);
-      await messages.addEvent({ messageId: m.id, messageUuid: m.uuid, type: 'sent', reason: providerId });
-      const score = await reputation.bump(domain, { sent: 1, delivered: 1 });
-      if (typeof score === 'number') this.scoreCache.set(domain, score);
-    } catch (err) {
-      await this._handleFailure(m, domain, err);
-    }
-  }
-
-  async _handleFailure(m, domain, err) {
-    const kind = classifyError(err);
-    const code = smtpResponseCode(err);
-    const reason = String((err && err.response) || (err && err.message) || err).slice(0, 1000);
-    const attempts = (m.attempts || 0) + 1; // claimSending already incremented in DB
-    const exhausted = attempts >= (m.max_attempts || 6);
-
-    if (kind === 'transient' && !exhausted) {
-      const delay = nextDelaySeconds(attempts);
-      if (delay != null) {
-        const next = new Date(Date.now() + delay * 1000);
-        await messages.markDeferred(m.id, next, reason);
-        await messages.addEvent({ messageId: m.id, messageUuid: m.uuid, type: 'deferred', smtpCode: code ? String(code) : null, reason });
-        const ds = await reputation.bump(domain, { deferred: 1 });
-        if (typeof ds === 'number') this.scoreCache.set(domain, ds);
-        return;
+    const due = await messages.selectDue({ limit: config.worker.batchSize });
+    for (const row of due) {
+      // Marketing: enforce per-domain reputation delay (in-process gate).
+      if (!bypassesPacing(row.msg_class)) {
+        const last = this.lastDomainSend.get(row.to_domain) || 0;
+        const delay = await domains.delayMsFor(row.to_domain);
+        if (Date.now() - last < delay) continue;
       }
-    }
-
-    // Permanent, or transient but out of retries → fail.
-    await messages.markFailed(m.id, reason);
-    await messages.addEvent({ messageId: m.id, messageUuid: m.uuid, type: 'failed', smtpCode: code ? String(code) : null, reason });
-    const bs = await reputation.bump(domain, { bounced: 1 });
-    if (typeof bs === 'number') this.scoreCache.set(domain, bs);
-
-    if (shouldSuppress(err)) {
-      try {
-        await suppression.suppress({ address: m.to_addr, scope: 'global', reason: 'hard_bounce', sourceUuid: m.uuid, note: reason.slice(0, 200) });
-        log.info(`[worker] suppressed ${m.to_addr} (hard reject ${code || ''})`);
-      } catch (e) { log.warn('[worker] suppress failed:', e.message); }
+      // Hard ceiling (transactional + marketing).
+      const reserved = await domains.tryReserveCeiling(row.to_domain);
+      if (!reserved) continue;
+      // Process (do NOT await — fan out so a slow SMTP doesn't block the tick).
+      this.processOne(row).catch((e) => log.error('[worker] processOne', e.message));
+      this.lastDomainSend.set(row.to_domain, Date.now());
     }
   }
 
-  async stop() {
-    this.stopping = true;
-    if (this.timer) clearTimeout(this.timer);
-    if (this.repTimer) clearInterval(this.repTimer);
+  async processOne(row) {
+    const claimed = await messages.claimSending(row.id);
+    if (!claimed) return;
+    const sender = await sendersSvc.getInternalById(row.sender_id);
+    if (!sender || sender.status !== 'active') {
+      await messages.markFailed(row.id, 'sender_disabled');
+      await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: row.sender_id, type: 'failed', reason: 'sender_disabled' });
+      return;
+    }
+    // Last-chance suppression (in case it was added since queue).
+    const sup = await suppression.isSuppressed(sender.uuid, row.to_addr);
+    if (sup) {
+      await messages.markFailed(row.id, `suppressed:${sup.reason}`);
+      await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: row.sender_id, type: 'dropped', reason: `suppression:${sup.reason}` });
+      return;
+    }
+
+    const prepared = await this._render(row, sender);
+    try {
+      const providerId = await transport.sendPrepared(sender, prepared, {
+        unsubscribeUrl: prepared.unsubscribeUrl,
+      });
+      await messages.markSent(row.id, providerId);
+      await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: sender.id, type: 'sent' });
+      await domains.bump(row.to_domain, { sent: 1, delivered: 1 });
+      await this._webhookEvent(sender.id, row, 'sent', { providerMessageId: providerId });
+    } catch (err) {
+      await this._handleSendError(row, sender, err);
+    }
+  }
+
+  /**
+   * Build the final {subject, html, text, headers, …} for SMTP from the stored
+   * outbox row. Batch-rows store templates + per-recipient _data/_actions in
+   * headers; single sends store fully-rendered subject/html/text already.
+   */
+  async _render(row, sender) {
+    let headers = {};
+    let data = null;
+    let actionUrls = null;
+    try { headers = row.headers ? JSON.parse(row.headers) : {}; } catch (_) {}
+    if (headers._template) {
+      data = headers._data || {};
+      actionUrls = headers._actions || {};
+      // Strip our internal keys before sending.
+      delete headers._template;
+      delete headers._data;
+      delete headers._actions;
+    }
+    const templateCtx = Object.assign({}, data || {}, actionUrls || {});
+
+    const subject = data ? render(row.subject, templateCtx) : (row.subject || '');
+    const html = data ? render(row.html, templateCtx) : (row.html || null);
+    const text = data ? render(row.body_text, templateCtx) : (row.body_text || null);
+
+    // Marketing: build per-recipient unsubscribe URL (no expiry-relevant data).
+    let unsubscribeUrl = null;
+    if (needsUnsubscribe(row.msg_class) && config.publicBaseUrl) {
+      const token = signToken(config.secrets.hmac, 'unsubscribe', row.id, 0);
+      unsubscribeUrl = `${config.publicBaseUrl}/unsubscribe/${encodeURIComponent(token)}`;
+    }
+
+    return {
+      uuid: row.uuid,
+      to: row.to_addr,
+      replyTo: row.reply_to,
+      subject, html, text,
+      msgClass: row.msg_class,
+      extraHeaders: headers,
+      unsubscribeUrl,
+    };
+  }
+
+  async _handleSendError(row, sender, err) {
+    const kind = classifyError(err);
+    const smtpCode = (err && err.responseCode) ? String(err.responseCode) : null;
+    const reason = err && err.message ? String(err.message).slice(0, 1000) : 'send failed';
+
+    if (kind === 'permanent') {
+      const isBounce = shouldSuppress(err);
+      if (isBounce) {
+        await messages.markBounced(row.id, { reason, smtpCode, bounceType: 'hard' });
+        await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: sender.id, type: 'bounced', smtpCode, bounceType: 'hard', reason });
+        await suppression.suppress({ address: row.to_addr, scope: 'global', reason: 'hard_bounce', sourceUuid: row.uuid });
+        await domains.bump(row.to_domain, { bounced: 1 });
+        await this._webhookEvent(sender.id, row, 'bounced', { smtpCode, bounceType: 'hard', reason });
+      } else {
+        await messages.markFailed(row.id, reason);
+        await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: sender.id, type: 'failed', smtpCode, reason });
+        await this._webhookEvent(sender.id, row, 'failed', { smtpCode, reason });
+      }
+      return;
+    }
+
+    // transient — defer with exponential backoff (attempts already incremented
+    // in claimSending).
+    const delaySec = nextDelaySeconds(row.attempts + 1);
+    if (delaySec == null) {
+      await messages.markFailed(row.id, reason);
+      await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: sender.id, type: 'failed', smtpCode, reason });
+      await this._webhookEvent(sender.id, row, 'failed', { smtpCode, reason });
+      return;
+    }
+    const nextAttemptAt = new Date(Date.now() + delaySec * 1000);
+    await messages.markDeferred(row.id, { nextAttemptAt, reason });
+    await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: sender.id, type: 'deferred', smtpCode, reason });
+    await domains.bump(row.to_domain, { deferred: 1 });
+    await this._webhookEvent(sender.id, row, 'deferred', { smtpCode, reason, nextAttemptAt });
+  }
+
+  async _webhookEvent(senderId, row, type, extra = {}) {
+    try {
+      await webhooks.enqueue({
+        senderId,
+        messageId: row.id,
+        batchId: row.batch_id,
+        eventType: type,
+        payload: {
+          event: type,
+          message_uuid: row.uuid,
+          to: row.to_addr,
+          class: row.msg_class,
+          batch_uuid: row.batch_id ? undefined : undefined,
+          ...extra,
+          occurred_at: new Date().toISOString(),
+        },
+      });
+    } catch (e) {
+      log.warn('[worker] webhook enqueue', e.message);
+    }
   }
 }
 

@@ -1,50 +1,57 @@
 'use strict';
 
+/**
+ * IMAP bounce poller. Reads unseen mail from the configured bounce mailbox,
+ * parses each as a DSN (RFC 3464) or ARF (RFC 5965) report, correlates back
+ * to the originating outbox row by uuid (VERP envelope or X-Mailer-Uuid),
+ * updates the message + domain reputation + suppression + webhook.
+ *
+ * Runs as a single instance (claim is not atomic across replicas).
+ */
+
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const config = require('../config');
 const log = require('../logger');
+const db = require('../db');
+const { parseBounce } = require('../lib/dsn');
 const messages = require('../services/messages');
 const suppression = require('../services/suppression');
-const reputation = require('../services/reputation');
-const { parseBounce } = require('../lib/dsn');
-const { domainOf } = require('../lib/addresses');
+const domains = require('../services/domains');
+const webhooks = require('../services/webhooks');
 
-/**
- * Monitored-mailbox bounce recorder. Polls the bounce/return-path mailbox over
- * IMAP, parses DSN (RFC 3464) + ARF feedback reports, records an email_event,
- * flips the matched message to `bounced`, and suppresses the address on a hard
- * bounce / complaint. Modeled on RightApp's parser.js, but pull (IMAP) instead
- * of the Kafka pipeline.
- */
 class BouncePoller {
   constructor() {
-    this.timer = null;
     this.running = false;
-    this.stopping = false;
+    this.timer = null;
   }
 
   start() {
     if (!config.bounce.enabled) {
-      log.info('[bounce] disabled (set MAILER_BOUNCE_ENABLED=true to enable)');
+      log.info('[bounce] disabled (MAILER_BOUNCE_ENABLED=false)');
       return;
     }
-    if (!config.bounce.imap.user) {
-      log.warn('[bounce] enabled but MAILER_BOUNCE_IMAP_USER is empty — skipping');
+    if (!config.bounce.imap.host || !config.bounce.imap.user) {
+      log.warn('[bounce] IMAP host/user not configured — skipping');
       return;
     }
-    const loop = async () => {
-      if (this.stopping) return;
-      try { await this.pollOnce(); } catch (e) { log.error('[bounce] poll error:', e.message); }
-      this.timer = setTimeout(loop, config.bounce.pollIntervalMs);
-    };
-    loop();
-    log.info(`[bounce] poller started (every ${config.bounce.pollIntervalMs}ms)`);
+    this.running = true;
+    log.info('[bounce] start (poll every', config.bounce.pollIntervalMs, 'ms)');
+    this.timer = setInterval(() => this.poll().catch((e) => log.error('[bounce] poll', e.message)),
+      config.bounce.pollIntervalMs);
+    // First poll immediately.
+    this.poll().catch((e) => log.error('[bounce] poll', e.message));
   }
 
-  async pollOnce() {
-    if (this.running) return; // never overlap polls
-    this.running = true;
+  stop() {
+    this.running = false;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    log.info('[bounce] stop');
+  }
+
+  async poll() {
+    if (!this.running) return;
     const client = new ImapFlow({
       host: config.bounce.imap.host,
       port: config.bounce.imap.port,
@@ -56,74 +63,102 @@ class BouncePoller {
       await client.connect();
       const lock = await client.getMailboxLock(config.bounce.mailbox);
       try {
-        const unseen = await client.search({ seen: false });
-        if (!unseen || !unseen.length) return;
-        for (const seq of unseen) {
+        for await (const msg of client.fetch({ seen: false }, { source: true, envelope: true })) {
           try {
-            const msg = await client.fetchOne(seq, { source: true });
-            if (!msg || !msg.source) continue;
-            await this.handleRaw(msg.source.toString('utf8'));
-            await client.messageFlagsAdd(seq, ['\\Seen']);
+            await this.handleRaw(msg.source);
+            await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
           } catch (e) {
-            log.warn(`[bounce] message ${seq} failed:`, e.message);
+            log.warn('[bounce] handle', e.message);
           }
         }
       } finally {
         lock.release();
       }
     } finally {
-      try { await client.logout(); } catch (_) { /* ignore */ }
-      this.running = false;
+      try { await client.logout(); } catch (_) {}
     }
   }
 
-  /** Parse one raw bounce/complaint message and record it. */
   async handleRaw(raw) {
-    // Prefer a structured parse for header access; fall back to the raw text.
-    let text = raw;
-    try {
-      const parsed = await simpleParser(raw);
-      text = [parsed.headerLines.map((h) => h.line).join('\n'), parsed.text || '', raw].join('\n');
-    } catch (_) { /* use raw */ }
+    const text = Buffer.isBuffer(raw) ? raw.toString('utf8') : String(raw || '');
+    const parsed = parseBounce(text);
+    if (!parsed.kind || !parsed.uuid) {
+      // Try a deeper parse for cases where the uuid is in an attached
+      // original message rather than the top headers.
+      try {
+        const m = await simpleParser(text);
+        const fallback = parseBounce((m.headers && m.headerLines && m.headerLines.map((h) => h.line).join('\n')) + '\n' + (m.text || ''));
+        if (fallback.uuid) {
+          parsed.uuid = parsed.uuid || fallback.uuid;
+          parsed.kind = parsed.kind || fallback.kind;
+          parsed.bounceClass = parsed.bounceClass || fallback.bounceClass;
+        }
+      } catch (_) {}
+    }
+    if (!parsed.kind || !parsed.uuid) {
+      log.warn('[bounce] no uuid in incoming mail — ignoring');
+      return;
+    }
 
-    const b = parseBounce(text);
-    if (!b.kind) return; // not a bounce/complaint we recognise
+    const message = await messages.findByIdOrUuid(parsed.uuid);
+    if (!message) {
+      log.warn(`[bounce] no message for uuid ${parsed.uuid}`);
+      return;
+    }
 
-    let message = b.uuid ? await messages.findByUuid(b.uuid) : null;
-    const messageId = message ? message.id : null;
-    const address = b.recipient || (message ? message.to_addr : null);
-
-    await messages.addEvent({
-      messageId,
-      messageUuid: b.uuid || null,
-      type: b.kind === 'complaint' ? 'complained' : 'bounced',
-      smtpCode: b.status || null,
-      bounceType: b.bounceClass || null,
-      reason: b.diagnostic || null,
-      raw: text.slice(0, 60000),
-    });
-
-    if (b.uuid) await messages.markBounced(b.uuid, b.diagnostic || b.status || b.kind);
-
-    // Hard bounce or complaint → global suppression (protects shared reputation).
-    const isHard = b.bounceClass === 'hard' || b.kind === 'complaint';
-    if (isHard && address) {
-      await suppression.suppress({
-        address,
-        scope: 'global',
-        reason: b.kind === 'complaint' ? 'complaint' : 'hard_bounce',
-        sourceUuid: b.uuid || null,
-        note: (b.diagnostic || '').slice(0, 200),
+    if (parsed.kind === 'complaint') {
+      await messages.markBounced(message.id, { reason: 'complaint' });
+      await messages.logEvent({
+        messageId: message.id, messageUuid: message.uuid, senderId: message.sender_id,
+        type: 'complained', smtpCode: parsed.status, reason: parsed.diagnostic, raw: text,
       });
-      const dom = domainOf(address);
-      if (dom) await reputation.bump(dom, b.kind === 'complaint' ? { complained: 1 } : { bounced: 1 });
-      log.info(`[bounce] ${b.kind} → suppressed ${address} (${b.status || ''})`);
+      await suppression.suppress({
+        address: message.to_addr, scope: 'global', reason: 'complaint', sourceUuid: message.uuid,
+      });
+      await domains.bump(message.to_domain, { complained: 1 });
+      await this.webhook(message, 'complained', { smtpCode: parsed.status, reason: parsed.diagnostic });
+      return;
+    }
+
+    // bounce — hard vs soft
+    const bc = parsed.bounceClass;
+    if (bc === 'hard') {
+      await messages.markBounced(message.id, { reason: parsed.diagnostic, smtpCode: parsed.status, bounceType: 'hard' });
+      await messages.logEvent({
+        messageId: message.id, messageUuid: message.uuid, senderId: message.sender_id,
+        type: 'bounced', smtpCode: parsed.status, bounceType: 'hard', reason: parsed.diagnostic, raw: text,
+      });
+      await suppression.suppress({
+        address: message.to_addr, scope: 'global', reason: 'hard_bounce', sourceUuid: message.uuid,
+      });
+      await domains.bump(message.to_domain, { bounced: 1 });
+      await this.webhook(message, 'bounced', { bounceType: 'hard', smtpCode: parsed.status, reason: parsed.diagnostic });
+    } else {
+      // soft — just record; don't suppress, don't change status (the original send
+      // succeeded; this is a downstream delayed bounce).
+      await messages.logEvent({
+        messageId: message.id, messageUuid: message.uuid, senderId: message.sender_id,
+        type: 'bounced', smtpCode: parsed.status, bounceType: 'soft', reason: parsed.diagnostic, raw: text,
+      });
+      await domains.bump(message.to_domain, { deferred: 1 });
+      await this.webhook(message, 'bounced', { bounceType: 'soft', smtpCode: parsed.status, reason: parsed.diagnostic });
     }
   }
 
-  stop() {
-    this.stopping = true;
-    if (this.timer) clearTimeout(this.timer);
+  async webhook(message, event, extra) {
+    try {
+      await webhooks.enqueue({
+        senderId: message.sender_id,
+        messageId: message.id,
+        batchId: message.batch_id,
+        eventType: event,
+        payload: {
+          event, message_uuid: message.uuid, to: message.to_addr,
+          class: message.msg_class, ...extra,
+          occurred_at: new Date().toISOString(),
+        },
+      });
+    } catch (e) { log.warn('[bounce] webhook enqueue', e.message); }
   }
 }
 

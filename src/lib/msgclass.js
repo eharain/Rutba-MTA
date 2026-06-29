@@ -1,23 +1,35 @@
 'use strict';
 
 /**
- * Message class: transactional vs bulk. Pure — tested in test/msgclass.test.mjs.
+ * Message class: transactional vs marketing.
+ * Pure — tested in test/msgclass.test.mjs.
  *
- * Transactional mail (password resets, receipts, lead notifications) must go out
- * immediately and bypasses the drip/bleed pacing. Bulk/marketing is paced and is
- * subject to per-tenant unsubscribe. Default is transactional (fail-safe: a
- * mislabelled send is delivered promptly rather than throttled).
+ * Transactional mail (password resets, receipts, lead notifications) is queue-
+ * prioritised and bypasses the per-domain reputation pacing. Marketing mail is
+ * sent after all pending transactional, paced by reputation, and carries an
+ * unsubscribe link.
+ *
+ * Default is 'transactional' (fail-safe): a mislabelled send is delivered
+ * promptly rather than throttled or unsubscribe-tagged.
  */
 
-const CLASSES = ['transactional', 'bulk'];
+const CLASSES = ['transactional', 'marketing'];
 
 function normalizeClass(c) {
-  return String(c == null ? '' : c).trim().toLowerCase() === 'bulk' ? 'bulk' : 'transactional';
+  const s = String(c == null ? '' : c).trim().toLowerCase();
+  // Accept the legacy 'bulk' synonym so older callers still work.
+  if (s === 'marketing' || s === 'bulk') return 'marketing';
+  return 'transactional';
 }
 
-/** Transactional sends skip the reputation/drip delay (but still obey concurrency). */
+/** Transactional skips the per-domain reputation delay (still obeys ceiling). */
 function bypassesPacing(c) {
   return normalizeClass(c) === 'transactional';
 }
 
-module.exports = { normalizeClass, bypassesPacing, CLASSES };
+/** Marketing-class mail gets List-Unsubscribe + a visible opt-out footer. */
+function needsUnsubscribe(c) {
+  return normalizeClass(c) === 'marketing';
+}
+
+module.exports = { normalizeClass, bypassesPacing, needsUnsubscribe, CLASSES };
