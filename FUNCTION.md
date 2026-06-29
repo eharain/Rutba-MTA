@@ -1,4 +1,4 @@
-# Mailer — Functional Definition
+# Rutba MTA — Functional Definition
 
 ## What it is
 

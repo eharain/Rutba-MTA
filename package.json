@@ -1,8 +1,7 @@
 {
-  "name": "trustlist-mailer",
+  "name": "rutba-mta",
   "version": "0.1.0",
-  "private": true,
-  "description": "Standalone, multi-product email sending gateway (MTA-aware) for TrustList, Rutba ERP and future offerings. Own MySQL DB; suppression, queueing, drip/bleed pacing, retry/backoff, per-domain reputation, and IMAP bounce capture. Deliberately outside Strapi — see docs/todo/37.",
+  "description": "Rutba MTA — open-source multi-tenant email relay middleware. Adaptive reputation-based rate control, suppression, templated batch sends, action interception, bounce processing, and delivery reporting.",
   "main": "src/index.js",
   "type": "commonjs",
   "engines": {
