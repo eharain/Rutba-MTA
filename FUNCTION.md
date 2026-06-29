@@ -192,7 +192,10 @@ convenience summary, not a replacement.
 
 ---
 
-## Database: `mailers`
+## Database
+
+The database name is **configurable** via the `MAILER_DB_NAME` environment variable.
+`mailers` is the recommended default but nothing is hardcoded.
 
 | Table | Purpose |
 |-------|---------|
