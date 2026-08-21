@@ -6,6 +6,8 @@ Rutba MTA sits between your applications and their outbound SMTP servers, handli
 
 > **It is not an MTA in the direct-to-MX sense.** Final delivery is always done by the sender's own registered SMTP server. Rutba MTA owns the middleware concerns; your SMTP relay owns DKIM, IP reputation, and MX routing.
 
+> This repo (formerly `Rutba-MTA`) now lives in the Rutba 2.0 workers tier as `workers/mta` - see [rutba-workers](https://github.com/eharain/rutba-workers). It remains a standalone, self-contained product.
+
 ---
 
 ## Documentation
