@@ -18,7 +18,7 @@ Rutba MTA sits between your applications and their outbound SMTP servers, handli
 | [CONTRIBUTING.md](./CONTRIBUTING.md) | How to file issues, code style, release process |
 | [SECURITY.md](./SECURITY.md) | Vulnerability disclosure + threat model |
 | [CHANGELOG.md](./CHANGELOG.md) | Version history |
-| [LICENSE](./LICENSE) | Apache License 2.0 |
+| [LICENSE](./LICENSE) | GNU AGPL v3.0 (+ commercial option, see [COMMERCIAL-LICENSE.md](./COMMERCIAL-LICENSE.md)) |
 
 ---
 
@@ -136,6 +136,8 @@ Full reference with request/response examples in [API.md](./API.md).
 
 ## License
 
-Apache License 2.0 — see [LICENSE](./LICENSE).
+Dual-licensed under the GNU AGPL v3.0 (see [LICENSE](./LICENSE)) and a
+separate commercial license — see [COMMERCIAL-LICENSE.md](./COMMERCIAL-LICENSE.md).
+Copyright (C) 2026 Tech Style Ltd — https://tech-style.co
 
 Contributions welcome — see [CONTRIBUTING.md](./CONTRIBUTING.md) for how to file issues, code style, and the release process.

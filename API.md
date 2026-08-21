@@ -376,7 +376,7 @@ Webhooks are signed with the sender's `webhookSecret`:
 ```http
 POST /your/webhook/endpoint HTTP/1.1
 Content-Type: application/json
-User-Agent: Rutba-MTA/1
+User-Agent: MTA/1
 X-Mailer-Event: sent
 X-Mailer-Delivery: 12345
 X-Mailer-Signature: sha256=<hmac-sha256-hex-of-body>

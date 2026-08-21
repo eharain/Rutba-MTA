@@ -4,6 +4,7 @@
   "description": "Rutba MTA — open-source multi-tenant email relay middleware. Adaptive reputation-based rate control, suppression, templated batch sends, action interception, bounce processing, and delivery reporting.",
   "main": "src/index.js",
   "type": "commonjs",
+  "license": "AGPL-3.0-or-later",
   "engines": {
     "node": ">=18.0.0 <=22.x.x"
   },

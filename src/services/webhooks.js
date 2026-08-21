@@ -49,7 +49,7 @@ async function deliverOne(row) {
   const body = typeof row.payload === 'string' ? row.payload : JSON.stringify(row.payload);
   const headers = {
     'Content-Type': 'application/json',
-    'User-Agent': 'Rutba-MTA/1',
+    'User-Agent': 'MTA/1',
     'X-Mailer-Event': row.event_type,
     'X-Mailer-Delivery': String(row.id),
   };
