@@ -73,6 +73,19 @@ const config = {
     tickMs: int(process.env.MAILER_WEBHOOK_TICK_MS, 5000),
   },
 
+  // The DNS gate (owner decision, 2026-08-25): a sending domain without its
+  // required records - SPF present, DKIM present at the sender's selector -
+  // is refused at enqueue and deferred at the worker. DMARC is advisory.
+  // MTA_DNS_GATE=0 is the reversible switch.
+  dnsGate: {
+    enabled: bool(process.env.MTA_DNS_GATE, true),
+    defaultSelector: process.env.MTA_DNS_DEFAULT_SELECTOR || 'default',
+    // Verified domains re-checked on this cadence (records can lapse)...
+    recheckSeconds: int(process.env.MTA_DNS_RECHECK_SECONDS, 21600),
+    // ...failed ones sooner - the sender is probably fixing DNS right now.
+    failRetrySeconds: int(process.env.MTA_DNS_FAIL_RETRY_SECONDS, 900),
+  },
+
   // Public base URL the action/unsubscribe links point at (this service).
   // MUST be set in production or links will be broken.
   publicBaseUrl: (process.env.MAILER_PUBLIC_URL || '').replace(/\/$/, ''),

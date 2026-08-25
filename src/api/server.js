@@ -28,6 +28,7 @@ function buildApp() {
   app.use('/v1/batches', require('./routes/batches'));
   app.use('/v1/suppressions', require('./routes/suppressions'));
   app.use('/v1/domains', require('./routes/domains'));
+  app.use('/v1/dns', require('./routes/dns'));         // sending-domain DNS gate state
 
   // 404 + error handler.
   app.use((req, res) => res.status(404).json({ error: 'not found' }));

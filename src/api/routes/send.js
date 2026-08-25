@@ -7,6 +7,7 @@
 
 const express = require('express');
 const { requireTrustToken } = require('../auth');
+const dnsGate = require('../../services/dns-gate');
 const messagesSvc = require('../../services/messages');
 const batchesSvc = require('../../services/batches');
 const suppression = require('../../services/suppression');
@@ -18,8 +19,30 @@ const { normalizeClass } = require('../../lib/msgclass');
 
 const router = express.Router();
 
+/**
+ * The DNS gate, at the front door: no SPF + DKIM at the sender's domain, no
+ * relay - refused before any outbox row exists (422, machine-readable), per
+ * the owner decision of 2026-08-25. The worker re-checks pre-send and defers,
+ * so anything already queued recovers when the records appear.
+ */
+async function requireVerifiedDomain(req, res, next) {
+  try {
+    const verdict = await dnsGate.ensureVerified(req.sender);
+    if (verdict.ok) return next();
+    return res.status(422).json({
+      error: 'domain_dns_unverified',
+      domain: verdict.domain,
+      missing: verdict.missing,
+      message: `Sending from ${verdict.domain} requires its DNS records first - missing: ${verdict.missing.join(', ')}. ` +
+        'Publish them, then retry (or POST /v1/dns/' + verdict.domain + '/verify to re-check now).',
+    });
+  } catch (e) {
+    return res.status(500).json({ error: 'dns gate failed', message: e.message });
+  }
+}
+
 // POST /v1/send  — single message
-router.post('/send', requireTrustToken, async (req, res) => {
+router.post('/send', requireTrustToken, requireVerifiedDomain, async (req, res) => {
   try {
     const b = req.body || {};
     const to = normalizeAddress(b.to);
@@ -72,7 +95,7 @@ router.post('/send', requireTrustToken, async (req, res) => {
 });
 
 // POST /v1/send/batch
-router.post('/send/batch', requireTrustToken, async (req, res) => {
+router.post('/send/batch', requireTrustToken, requireVerifiedDomain, async (req, res) => {
   try {
     const b = req.body || {};
     if (!Array.isArray(b.recipients) || !b.recipients.length) {

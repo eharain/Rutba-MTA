@@ -36,6 +36,7 @@ router.post('/', async (req, res) => {
       address: body.address,
       displayName: body.displayName,
       replyTo: body.replyTo,
+      dkimSelector: body.dkimSelector,
       smtp: body.smtp,
       webhookUrl: body.webhookUrl,
       isAdmin: first ? true : !!body.isAdmin,

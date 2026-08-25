@@ -19,6 +19,7 @@ const config = require('../config');
 const messages = require('../services/messages');
 const sendersSvc = require('../services/senders');
 const suppression = require('../services/suppression');
+const dnsGate = require('../services/dns-gate');
 const domains = require('../services/domains');
 const webhooks = require('../services/webhooks');
 const transport = require('../smtp/transport');
@@ -99,6 +100,18 @@ class SendWorker {
     if (sup) {
       await messages.markFailed(row.id, `suppressed:${sup.reason}`);
       await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: row.sender_id, type: 'dropped', reason: `suppression:${sup.reason}` });
+      return;
+    }
+
+    // The DNS gate's pre-send belt (the enqueue gate is primary). DEFER, not
+    // fail: mail queued while the gate was off - or before the records
+    // lapsed - flows the moment they appear, on the gate's own retry cadence.
+    const dns = await dnsGate.ensureVerified(sender);
+    if (!dns.ok) {
+      const reason = `dns_gate: ${dns.domain} missing ${dns.missing.join(', ')}`;
+      const nextAttemptAt = new Date(Date.now() + config.dnsGate.failRetrySeconds * 1000);
+      await messages.markDeferred(row.id, { nextAttemptAt, reason });
+      await messages.logEvent({ messageId: row.id, messageUuid: row.uuid, senderId: sender.id, type: 'deferred', reason });
       return;
     }
 

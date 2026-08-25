@@ -18,7 +18,7 @@ const config = require('../config');
 // NOTE: `s.id` is selected but mapped to `_id` in publicView; apiView() strips
 // it before returning over HTTP so the numeric pk never leaks.
 const PUBLIC_FIELDS = `
-  s.id, s.uuid, s.address, s.display_name, s.reply_to,
+  s.id, s.uuid, s.address, s.display_name, s.reply_to, s.dkim_selector,
   s.smtp_host, s.smtp_port, s.smtp_secure, s.smtp_username,
   s.webhook_url, s.is_admin, s.status, s.created_at, s.updated_at
 `;
@@ -34,6 +34,7 @@ function publicView(row) {
     address: row.address,
     displayName: row.display_name,
     replyTo: row.reply_to,
+    dkimSelector: row.dkim_selector,
     smtp: {
       host: row.smtp_host,
       port: row.smtp_port,
@@ -63,6 +64,7 @@ async function register({
   address,
   displayName = null,
   replyTo = null,
+  dkimSelector = null,
   smtp,
   webhookUrl = null,
   isAdmin = false,
@@ -81,12 +83,12 @@ async function register({
 
   await db.query(
     `INSERT INTO sender
-      (uuid, address, display_name, reply_to,
+      (uuid, address, display_name, reply_to, dkim_selector,
        smtp_host, smtp_port, smtp_secure, smtp_username, smtp_password_enc,
        webhook_url, webhook_secret, is_admin, status, trust_token_hash)
-     VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?, 'active', ?)`,
+     VALUES (?,?,?,?,?, ?,?,?,?,?, ?,?,?, 'active', ?)`,
     [
-      uuid, addr, displayName, replyTo,
+      uuid, addr, displayName, replyTo, dkimSelector ? String(dkimSelector).trim() : null,
       smtp.host, smtp.port || 587, smtp.secure ? 1 : 0, smtp.username || null, smtpPasswordEnc,
       webhookUrl, webhookSecret, isAdmin ? 1 : 0, tokenHash,
     ]
@@ -129,7 +131,7 @@ async function authenticate(trustToken) {
  */
 async function getInternalById(id) {
   const rows = await db.query(
-    `SELECT id, uuid, address, display_name, reply_to,
+    `SELECT id, uuid, address, display_name, reply_to, dkim_selector,
             smtp_host, smtp_port, smtp_secure, smtp_username, smtp_password_enc,
             webhook_url, webhook_secret, is_admin, status
        FROM sender WHERE id = ? LIMIT 1`,
