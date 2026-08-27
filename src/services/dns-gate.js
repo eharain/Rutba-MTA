@@ -25,6 +25,9 @@
 const db = require('../db');
 const config = require('../config');
 const log = require('../logger');
+// dns-verify is a vendored copy of @rutba/mail-dns (consumer/packages/mail-dns):
+// one definition of "the records are right" across the estate, presence-only
+// on DKIM here because this relay never holds the sender's signing key.
 const { verifySendingDomain } = require('../lib/dns-verify');
 
 const domainOf = (address) => String(address || '').split('@')[1]?.toLowerCase() || '';
@@ -80,7 +83,7 @@ async function ensureVerified(sender, { resolver, force = false } = {}) {
 
   if (!fresh) {
     try {
-      const verdict = await verifySendingDomain(domain, selector, resolver ? { resolver } : {});
+      const verdict = await verifySendingDomain(domain, { selector, ...(resolver ? { resolver } : {}) });
       row = await upsertVerdict(domain, selector, verdict);
     } catch (e) {
       log.error(`[dns-gate] ${domain} check failed: ${e.message}`);
