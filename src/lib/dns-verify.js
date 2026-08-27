@@ -159,6 +159,102 @@ async function checkDkim(domain, { selector, expectedKey, resolver = realDns } =
   return { ok: true, observed };
 }
 
+/**
+ * PTR / forward-confirmed reverse DNS for every address a mail host answers on.
+ *
+ * The check that catches the classic provider-default-PTR defect, and the one
+ * the estate is currently failing: the A record's PTR is set correctly, the
+ * AAAA record's is still the hosting vendor's own hostname, every IPv4
+ * hand-test passes, and outbound over IPv6 fails FCrDNS at Google and other
+ * large receivers. Half-configured is the worst state - it looks fine.
+ *
+ * Forward-confirmed means both directions agree: address -> PTR name, and
+ * that name -> back to the same address. A PTR alone is forgeable by whoever
+ * controls the reverse zone, so receivers that care check both.
+ *
+ * Per-family verdicts are reported separately because the remedy differs:
+ * a failing IPv4 PTR must be fixed, while a failing IPv6 one can be fixed OR
+ * routed around by disabling IPv6 egress (mailcow ENABLE_IPV6=false) until it
+ * is. Callers need to be able to tell those two apart.
+ */
+async function checkPtr(host, { expectedHost, resolver = realDns } = {}) {
+  const name = norm(host);
+  if (!name) throw new Error('checkPtr: a host is required');
+  const wanted = norm(expectedHost) || name;
+
+  const addressesOf = async (method) => {
+    try {
+      return (await resolver[method](name)) || [];
+    } catch (e) {
+      // No AAAA is not a fault - a v4-only host is a legitimate posture.
+      if (e && (e.code === 'ENOTFOUND' || e.code === 'ENODATA')) return [];
+      throw e;
+    }
+  };
+  const [v4, v6] = await Promise.all([addressesOf('resolve4'), addressesOf('resolve6')]);
+
+  const inspect = async (address, family) => {
+    let names = [];
+    try {
+      names = (await resolver.reverse(address)) || [];
+    } catch (e) {
+      if (!(e && (e.code === 'ENOTFOUND' || e.code === 'ENODATA'))) throw e;
+    }
+    const ptr = names.map(norm);
+    if (ptr.length === 0) {
+      return { address, family, ptr, ok: false, missing: `PTR for ${address} (large receivers reject on this alone)` };
+    }
+    if (!ptr.includes(wanted)) {
+      return {
+        address, family, ptr, ok: false,
+        missing: `PTR for ${address} -> ${ptr.join(', ')}, expected ${wanted}`,
+      };
+    }
+    // The forward half. `wanted` is normally the host we just resolved, so the
+    // answers are already in hand; only look again when it is some other name.
+    let forward = family === 'ipv6' ? v6 : v4;
+    if (wanted !== name) {
+      try {
+        forward = (await resolver[family === 'ipv6' ? 'resolve6' : 'resolve4'](wanted)) || [];
+      } catch (e) {
+        if (e && (e.code === 'ENOTFOUND' || e.code === 'ENODATA')) forward = [];
+        else throw e;
+      }
+    }
+    if (!forward.includes(address)) {
+      return {
+        address, family, ptr, ok: false,
+        missing: `${wanted} does not resolve back to ${address} (reverse set, forward does not confirm)`,
+      };
+    }
+    return { address, family, ptr, ok: true };
+  };
+
+  const observed = await Promise.all([
+    ...v4.map((a) => inspect(a, 'ipv4')),
+    ...v6.map((a) => inspect(a, 'ipv6')),
+  ]);
+
+  const byFamily = (f) => observed.filter((r) => r.family === f);
+  const familyOk = (f) => {
+    const rows = byFamily(f);
+    return rows.length > 0 && rows.every((r) => r.ok);
+  };
+
+  if (observed.length === 0) {
+    return { ok: false, observed, ipv4Ok: false, ipv6Ok: null, missing: [`no A or AAAA record for ${name}`] };
+  }
+
+  return {
+    ok: observed.every((r) => r.ok),
+    observed,
+    ipv4Ok: familyOk('ipv4'),
+    // null, not false: a host with no AAAA is not failing IPv6, it is not on it.
+    ipv6Ok: byFamily('ipv6').length ? familyOk('ipv6') : null,
+    missing: observed.filter((r) => !r.ok).map((r) => r.missing),
+  };
+}
+
 /** DMARC: advisory. Reported, never blocking. */
 async function checkDmarc(domain, { resolver = realDns } = {}) {
   const name = norm(domain);
@@ -249,7 +345,7 @@ async function checkOwnershipTxt(domain, { expectedToken, prefix = '_rutba-verif
 
 module.exports = {
   DEFAULT_DKIM_SELECTOR,
-  checkMx, checkSpf, checkDkim, checkDmarc,
+  checkMx, checkSpf, checkDkim, checkDmarc, checkPtr,
   verifyDomain, verifySendingDomain,
   // Exported for non-mail callers; see checkOwnershipTxt's note.
   checkOwnershipTxt, txtRecords,
