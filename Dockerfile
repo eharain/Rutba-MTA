@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # Standalone email gateway image. Independent of the monorepo image — its own
-# node_modules + its own MySQL database. Shared by TrustList, Rutba ERP, etc.
+# node_modules + its own MySQL database. Shared by TrustList, Rutba Suite, etc.
 
 FROM node:22-bookworm-slim AS base
 WORKDIR /app

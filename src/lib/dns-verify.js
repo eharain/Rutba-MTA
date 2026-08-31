@@ -21,7 +21,7 @@
  *
  * Two products ask it, for two different reasons, and both are served here:
  *
- *   HOSTING (comm.mail / the ERP mail-domain path) - "will mail for this
+ *   HOSTING (comm.mail / the suite's mail-domain path) - "will mail for this
  *     domain arrive at our mailboxes, and will what we send be trusted?"
  *     Blocking: MX + SPF + DKIM. We hold the signing key, so DKIM is checked
  *     by KEY MATCH: a stale key from a previous provider passes a presence
@@ -35,7 +35,7 @@
  *
  * The difference between them is which options the caller passes, not which
  * implementation runs. That is the whole point of this file: the two used to
- * be separate copies and they forked - the ERP's grew key-match, the MTA's
+ * be separate copies and they forked - the suite's grew key-match, the MTA's
  * did not, and neither knew.
  *
  * Contract, uniform across every check:
@@ -270,6 +270,105 @@ async function checkDmarc(domain, { resolver = realDns } = {}) {
 }
 
 /**
+ * MTA-STS (RFC 8461): does the domain tell senders to require TLS?
+ *
+ * Two halves, and both have to be right or the policy does nothing: a TXT
+ * record at `_mta-sts.<domain>` announcing a policy id, and a policy document
+ * served over HTTPS at `mta-sts.<domain>/.well-known/mta-sts.txt`. This checks
+ * the DNS half only — the document is ours to SERVE, and is built by
+ * `mtaStsPolicy()` below.
+ *
+ * Advisory, deliberately. MTA-STS protects mail COMING IN from senders who
+ * honour it; a domain without it still receives mail perfectly well, so
+ * refusing to provision a mailbox over a missing one would be blocking a
+ * customer for a hardening measure rather than a correctness one. It belongs
+ * in the records panel as a recommendation, which is where advisory checks go.
+ *
+ * The `id` is compared when the caller knows what it published: a stale id
+ * means senders are caching a policy we have since changed, which is exactly
+ * the failure that looks fine from the outside.
+ */
+async function checkMtaSts(domain, { expectedId, resolver = realDns } = {}) {
+  const name = norm(domain);
+  if (!name) throw new Error('checkMtaSts: domain is required');
+  const all = await txtRecords(resolver, `_mta-sts.${name}`);
+  const observed = all.filter((t) => /^v=STSv1(\s|;|$)/i.test(t.trim()));
+  if (!observed.length) {
+    return { ok: false, observed, advisory: true, missing: `MTA-STS TXT at _mta-sts.${name}` };
+  }
+  if (expectedId) {
+    const found = observed.some((t) => new RegExp(`id\\s*=\\s*${expectedId}(\\s|;|$)`, 'i').test(t));
+    if (!found) {
+      return {
+        ok: false, observed, advisory: true,
+        missing: `MTA-STS id at _mta-sts.${name} is not ${expectedId} — senders are caching an older policy`,
+      };
+    }
+  }
+  return { ok: true, observed, advisory: true };
+}
+
+/**
+ * TLS-RPT (RFC 8460): where should receivers send TLS failure reports?
+ *
+ * Advisory for the same reason, and useful for a different one: it is the only
+ * way to learn that someone's mail to us is failing TLS negotiation before
+ * they tell us. Worth having precisely because its absence is silent.
+ */
+async function checkTlsRpt(domain, { resolver = realDns } = {}) {
+  const name = norm(domain);
+  if (!name) throw new Error('checkTlsRpt: domain is required');
+  const all = await txtRecords(resolver, `_smtp._tls.${name}`);
+  const observed = all.filter((t) => /^v=TLSRPTv1(\s|;|$)/i.test(t.trim()));
+  return {
+    ok: observed.length > 0,
+    observed,
+    advisory: true,
+    ...(observed.length ? {} : { missing: `TLS-RPT TXT at _smtp._tls.${name}` }),
+  };
+}
+
+/**
+ * The MTA-STS policy document, exactly as RFC 8461 §3.2 wants it served:
+ * `text/plain`, CRLF-separated, at
+ * `https://mta-sts.<domain>/.well-known/mta-sts.txt`.
+ *
+ * `mode` is the whole safety story. `testing` means "report failures but
+ * deliver anyway", and it is the default here on purpose: publishing
+ * `enforce` before the MX names and certificates are known-good tells every
+ * major sender to REFUSE mail to the domain, which is a self-inflicted outage
+ * that looks like someone else's bug. Move to enforce once TLS-RPT is quiet.
+ *
+ * `max_age` is how long senders cache this, so a short life is the right
+ * choice while the policy is still changing — a mistake published with a long
+ * max_age keeps being honoured long after it is fixed.
+ */
+function mtaStsPolicy({ mx, mode = 'testing', maxAge = 86400 } = {}) {
+  const hosts = (Array.isArray(mx) ? mx : [mx]).map(norm).filter(Boolean);
+  if (!hosts.length) throw new Error('mtaStsPolicy: at least one mx host is required');
+  if (!['testing', 'enforce', 'none'].includes(mode)) {
+    throw new Error("mtaStsPolicy: mode must be 'testing', 'enforce' or 'none'");
+  }
+  const age = Number(maxAge);
+  if (!Number.isInteger(age) || age < 1) throw new Error('mtaStsPolicy: maxAge must be a positive integer');
+  return [
+    'version: STSv1',
+    `mode: ${mode}`,
+    ...hosts.map((host) => `mx: ${host}`),
+    `max_age: ${age}`,
+  ].join('\r\n').concat('\r\n');
+}
+
+/**
+ * The TXT record that announces a policy. The id must CHANGE whenever the
+ * policy document does, or senders keep serving themselves the cached copy.
+ */
+const mtaStsRecord = (id) => `v=STSv1; id=${String(id || '').trim()}`;
+
+/** The TXT record naming where TLS failure reports go. */
+const tlsRptRecord = (mailto) => `v=TLSRPTv1; rua=mailto:${String(mailto || '').trim()}`;
+
+/**
  * HOSTING verdict for one domain against its expected records.
  * Blocking = MX + SPF + DKIM; DMARC rides along as advisory.
  */
@@ -345,8 +444,10 @@ async function checkOwnershipTxt(domain, { expectedToken, prefix = '_rutba-verif
 
 module.exports = {
   DEFAULT_DKIM_SELECTOR,
-  checkMx, checkSpf, checkDkim, checkDmarc, checkPtr,
+  checkMx, checkSpf, checkDkim, checkDmarc, checkPtr, checkMtaSts, checkTlsRpt,
   verifyDomain, verifySendingDomain,
   // Exported for non-mail callers; see checkOwnershipTxt's note.
   checkOwnershipTxt, txtRecords,
+  // Documents and records we PUBLISH rather than check.
+  mtaStsPolicy, mtaStsRecord, tlsRptRecord,
 };
