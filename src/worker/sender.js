@@ -168,6 +168,13 @@ class SendWorker {
       msgClass: row.msg_class,
       extraHeaders: headers,
       unsubscribeUrl,
+      // Carried through untouched: an iCalendar object is not a template and
+      // must not be rendered. A {{token}} inside a UID or a DTSTART would be
+      // substituted into nonsense, and the part has to arrive byte-identical
+      // to what the calendar signed off.
+      calendar: row.calendar_content
+        ? { method: row.calendar_method || 'REQUEST', content: row.calendar_content }
+        : null,
     };
   }
 

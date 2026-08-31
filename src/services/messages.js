@@ -18,7 +18,7 @@ const { maxAttempts } = require('../lib/backoff');
 async function createQueued({
   senderId, batchId = null, msgClass = 'transactional',
   from, replyTo = null, to, subject = null, html = null, text = null,
-  headers = null, scheduledAt = null,
+  headers = null, scheduledAt = null, calendar = null,
 }) {
   const uuid = randomUUID();
   const cls = normalizeClass(msgClass);
@@ -27,12 +27,14 @@ async function createQueued({
   const res = await db.query(
     `INSERT INTO outbox
       (uuid, sender_id, batch_id, msg_class, from_addr, reply_to, to_addr, to_domain,
-       subject, html, body_text, headers, status, attempts, max_attempts,
-       next_attempt_at, scheduled_at)
-     VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?, 'queued', 0, ?, ?, ?)`,
+       subject, html, body_text, headers, calendar_method, calendar_content,
+       status, attempts, max_attempts, next_attempt_at, scheduled_at)
+     VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?, 'queued', 0, ?, ?, ?)`,
     [
       uuid, senderId, batchId, cls, from, replyTo, toAddr, toDomain,
       subject, html, text, headers ? JSON.stringify(headers) : null,
+      calendar ? String(calendar.method || 'REQUEST').toUpperCase() : null,
+      calendar ? String(calendar.content || '') : null,
       maxAttempts(), scheduledAt || new Date(), scheduledAt,
     ]
   );

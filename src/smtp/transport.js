@@ -80,6 +80,19 @@ async function sendPrepared(sender, prepared, { unsubscribeUrl = null } = {}) {
     text: prepared.text || undefined,
     messageId: `<${prepared.uuid}@${fromDomain}>`,
     headers,
+    // iMIP (RFC 6047): the iCalendar object rides as a text/calendar part
+    // carrying the METHOD, which is what makes a recipient's client offer
+    // Accept / Decline rather than a file to download. nodemailer builds the
+    // multipart/alternative; we only say what the part is.
+    ...(prepared.calendar
+      ? {
+        icalEvent: {
+          method: prepared.calendar.method,
+          content: prepared.calendar.content,
+          filename: 'invite.ics',
+        },
+      }
+      : {}),
     envelope: { from: envelopeFrom, to: prepared.to },
   });
   return info && info.messageId ? info.messageId : null;

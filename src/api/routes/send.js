@@ -71,6 +71,12 @@ router.post('/send', requireTrustToken, requireVerifiedDomain, async (req, res) 
       subject, html, text,
       headers: b.headers,
       scheduledAt: b.scheduledAt ? new Date(b.scheduledAt) : null,
+      // `{ method, content }` — an iCalendar object to carry as a
+      // text/calendar part. Never rendered as a template: a {{token}} inside a
+      // UID or DTSTART would be substituted into nonsense.
+      calendar: b.calendar && b.calendar.content
+        ? { method: b.calendar.method, content: b.calendar.content }
+        : null,
     });
 
     // Actions: if any, generate tokens, re-render subject/html/text with them.
