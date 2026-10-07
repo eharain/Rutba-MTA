@@ -11,7 +11,8 @@ ENV NODE_ENV=production \
 
 # Install production deps only (cache on manifest).
 COPY package.json package-lock.json* ./
-RUN npm install --omit=dev --no-audit --no-fund
+# --ignore-scripts: the package "prepare" script sets git hooks, and git is not in the image.
+RUN npm install --omit=dev --no-audit --no-fund --ignore-scripts
 
 COPY . .
 
