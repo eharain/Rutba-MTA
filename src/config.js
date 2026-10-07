@@ -37,10 +37,14 @@ const config = {
 
   // VERP bounce return-path. Outbound envelope-from becomes
   // bounce+<uuid>@<bounceDomain> so the IMAP poller can match bounces back to
-  // the originating message by uuid.
+  // the originating message by uuid. Set MAILER_BOUNCE_DOMAIN to an empty
+  // value to send with the sender's own address as envelope-from instead: an
+  // SMTP relay that ties the envelope to the login (mailcow) refuses a VERP
+  // address on a domain it does not host, so nothing can go out until the
+  // bounce domain exists. Bounces then go to the sender's own mailbox.
   bounce: {
     enabled: bool(process.env.MAILER_BOUNCE_ENABLED, false),
-    domain: process.env.MAILER_BOUNCE_DOMAIN || 'bounce.rutba-mta.local',
+    domain: process.env.MAILER_BOUNCE_DOMAIN !== undefined ? process.env.MAILER_BOUNCE_DOMAIN.trim() : 'bounce.rutba-mta.local',
     mailbox: process.env.MAILER_BOUNCE_MAILBOX || 'INBOX',
     pollIntervalMs: int(process.env.MAILER_BOUNCE_POLL_MS, 60000),
     imap: {
