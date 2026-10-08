@@ -21,9 +21,11 @@ const domains = require('../services/domains');
 const webhooks = require('../services/webhooks');
 
 class BouncePoller {
-  constructor() {
+  constructor({ createClient } = {}) {
     this.running = false;
+    this.polling = false;
     this.timer = null;
+    if (createClient) this.createClient = createClient;
   }
 
   start() {
@@ -37,10 +39,9 @@ class BouncePoller {
     }
     this.running = true;
     log.info('[bounce] start (poll every', config.bounce.pollIntervalMs, 'ms)');
-    this.timer = setInterval(() => this.poll().catch((e) => log.error('[bounce] poll', e.message)),
-      config.bounce.pollIntervalMs);
+    this.timer = setInterval(() => this.tick(), config.bounce.pollIntervalMs);
     // First poll immediately.
-    this.poll().catch((e) => log.error('[bounce] poll', e.message));
+    this.tick();
   }
 
   stop() {
@@ -50,32 +51,72 @@ class BouncePoller {
     log.info('[bounce] stop');
   }
 
-  async poll() {
-    if (!this.running) return;
-    const client = new ImapFlow({
+  /**
+   * One poll at a time. A slow or stalled mailbox must not stack a new
+   * connection every interval on top of the one still open.
+   */
+  async tick() {
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      await this.poll();
+    } catch (e) {
+      log.error('[bounce] poll', e && e.message);
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  createClient() {
+    return new ImapFlow({
       host: config.bounce.imap.host,
       port: config.bounce.imap.port,
       secure: config.bounce.imap.secure,
       auth: { user: config.bounce.imap.user, pass: config.bounce.imap.pass },
       logger: false,
     });
+  }
+
+  async poll() {
+    if (!this.running) return;
+    const client = this.createClient();
+    // imapflow reports a socket timeout or a dropped connection as an 'error'
+    // event on the instance. With no listener Node treats it as uncaught and
+    // the process exits - it did, twice in five minutes on 2026-10-08, and a
+    // send in flight would have been cut off. Logged and dropped: the next
+    // tick opens a fresh connection.
+    client.on('error', (e) => log.warn('[bounce] imap', (e && (e.code || e.message)) || 'error'));
     try {
       await client.connect();
       const lock = await client.getMailboxLock(config.bounce.mailbox);
       try {
-        for await (const msg of client.fetch({ seen: false }, { source: true, envelope: true })) {
+        // Collect first, act after. imapflow runs one command at a time, so a
+        // command issued inside a fetch loop waits for the fetch, which waits
+        // for it: marking \Seen there never completed, the same message was
+        // read every minute, and the stalled connection timed out (the crash
+        // above).
+        const unseen = [];
+        for await (const msg of client.fetch({ seen: false }, { source: true })) {
+          unseen.push({ uid: msg.uid, source: msg.source });
+        }
+        const read = [];
+        for (const msg of unseen) {
           try {
             await this.handleRaw(msg.source);
-            await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
+            read.push(msg.uid);
           } catch (e) {
+            // Left unseen: tried again on the next tick.
             log.warn('[bounce] handle', e.message);
           }
         }
+        // A report we used and mail we cannot use (no uuid: not a bounce of
+        // ours) are both read now, so neither is fetched again.
+        if (read.length) await client.messageFlagsAdd(read, ['\\Seen'], { uid: true });
       } finally {
         lock.release();
       }
     } finally {
-      try { await client.logout(); } catch (_) {}
+      try { await client.logout(); } catch (_) { try { client.close(); } catch (__) { /* gone already */ } }
     }
   }
 
