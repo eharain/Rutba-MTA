@@ -6,7 +6,7 @@
   "type": "commonjs",
   "license": "AGPL-3.0-or-later",
   "engines": {
-    "node": ">=18.0.0 <=22.x.x"
+    "node": ">=20.0.0 <=22.x.x"
   },
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
@@ -17,8 +17,8 @@
   "dependencies": {
     "express": "^4.21.2",
     "imapflow": "^1.0.171",
-    "mailparser": "^3.7.1",
-    "mysql2": "^3.11.5",
+    "mailparser": "^3.9.39",
+    "mysql2": "^3.24.6",
     "nodemailer": "^6.9.16"
   }
 }

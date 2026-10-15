@@ -8,7 +8,7 @@ This guide covers a production install: prerequisites, MySQL setup, environment 
 
 | Component | Recommended |
 |-----------|-------------|
-| Node.js | 22.x LTS (≥18 supported) |
+| Node.js | 22.x LTS (≥20 supported) |
 | MySQL | 8.0+ (5.7 works with caveats) |
 | SMTP relay | Mailcow, Postfix, AWS SES, or any standard SMTP. Each registered sender brings their own. |
 | Bounce mailbox | One IMAP mailbox at a domain you control (e.g. `bounces@bounce.example.com`) |

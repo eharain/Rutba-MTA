@@ -127,7 +127,7 @@ Full reference with request/response examples in [API.md](./API.md).
 
 ## Tech
 
-- **Runtime**: Node.js ≥ 18 (22 LTS recommended)
+- **Runtime**: Node.js ≥ 20 (22 LTS recommended)
 - **Storage**: MySQL 8 (5.7 works with caveats)
 - **Outbound SMTP**: any standard SMTP relay per sender (nodemailer-driven)
 - **Bounce capture**: IMAP via [imapflow](https://www.npmjs.com/package/imapflow) + [mailparser](https://www.npmjs.com/package/mailparser)
