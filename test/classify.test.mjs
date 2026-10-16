@@ -31,6 +31,26 @@ test('EENVELOPE is permanent but never suppresses (our-side problem)', () => {
   assert.equal(shouldSuppress({ code: 'EENVELOPE' }), false);
 });
 
+test('EENVELOPE with a 5xx recipient rejection at RCPT TO suppresses', () => {
+  // What nodemailer rejects sendMail with when the only recipient is refused.
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO', responseCode: 550, response: '550 5.1.1 user unknown' }), true);
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO', responseCode: 550, response: '550 5.2.1 mailbox disabled' }), true);
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO', responseCode: 551, response: '551 user not local' }), true);
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO', responseCode: 553, response: '553 mailbox name not allowed' }), true);
+});
+
+test('EENVELOPE that is not a recipient rejection never suppresses', () => {
+  // No responseCode: a malformed or empty envelope on our side.
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'API' }), false);
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO' }), false);
+  // Our sender address refused at MAIL FROM, even with a 5.1.x code.
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'MAIL FROM', responseCode: 553, response: '553 5.1.8 sender address rejected' }), false);
+  // A 4xx at RCPT TO is transient.
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO', responseCode: 450, response: '450 4.2.1 try later' }), false);
+  // A 5xx at RCPT TO that is not a recipient-rejection code.
+  assert.equal(shouldSuppress({ code: 'EENVELOPE', command: 'RCPT TO', responseCode: 554, response: '554 5.7.1 relay access denied' }), false);
+});
+
 test('recipient-rejection codes suppress', () => {
   assert.equal(shouldSuppress({ responseCode: 550, response: '550 5.1.1 user unknown' }), true);
   assert.equal(shouldSuppress({ responseCode: 550, response: '550 mailbox unavailable' }), true);

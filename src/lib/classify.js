@@ -45,7 +45,13 @@ const SUPPRESS_STATUS_RE = /5\.(1\.[0-9]+|2\.1)/;
 function shouldSuppress(err) {
   if (classifyError(err) !== 'permanent') return false;
   const rc = smtpResponseCode(err);
-  if (String((err && err.code) || '') === 'EENVELOPE') return false;
+  // EENVELOPE is our-side (no responseCode: a malformed or empty envelope;
+  // MAIL FROM: our sender address refused) unless the server refused the
+  // recipient with a 5xx at RCPT TO, which is a hard bounce like any other.
+  if (String((err && err.code) || '') === 'EENVELOPE') {
+    const refusedAtRcpt = (err && err.command) === 'RCPT TO';
+    if (!refusedAtRcpt || rc == null || rc < 500 || rc >= 600) return false;
+  }
   const response = String((err && err.response) || '');
   if (SUPPRESS_STATUS_RE.test(response)) return true;
   // Bare 550/551/553 (mailbox unavailable / user not local) → suppress.
